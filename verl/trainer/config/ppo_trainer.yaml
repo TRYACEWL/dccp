@@ -94,7 +94,7 @@ actor_rollout_ref:
     vla: openvla-oft
     action_token_len: 7
     action_chunks_len: 8
-    path: ~/models/deepseek-llm-7b-chat
+    path: checkpoint_files/base_models/deepseek-llm-7b-chat
     external_lib: null
     override_config: { }
     enable_gradient_checkpointing: False
@@ -255,7 +255,7 @@ reward_model:
     action_token_len: ${actor_rollout_ref.model.action_token_len}
     action_chunks_len: ${actor_rollout_ref.model.action_chunks_len}
     input_tokenizer: ${actor_rollout_ref.model.path}
-    path: ~/models/FsfairX-LLaMA3-RM-v0.1
+    path: checkpoint_files/reward_models/FsfairX-LLaMA3-RM-v0.1
     external_lib: ${actor_rollout_ref.model.external_lib}
     use_remove_padding: ${actor_rollout_ref.model.use_remove_padding}
 
@@ -277,9 +277,9 @@ reward_model:
 
   prime_model:
     input_tokenizer: ${actor_rollout_ref.model.path}
-    path: /data_jiang/wl/DCCP/prime_model
+    path: checkpoint_files/prime_model
     ref_type: freeze
-    ref_path: /data_jiang/wl/DCCP/reference_model
+    ref_path: checkpoint_files/reference_model
     external_lib: ${actor_rollout_ref.model.external_lib}
     enable_gradient_checkpointing: ${actor_rollout_ref.model.enable_gradient_checkpointing}
     use_remove_padding: ${actor_rollout_ref.model.use_remove_padding}
