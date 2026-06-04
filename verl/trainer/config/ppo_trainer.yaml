@@ -9,122 +9,87 @@ data:
   max_response_length: 512
   train_batch_size: 1024
   val_batch_size: 1312
-  return_raw_input_ids: False  # This should be set to true when the tokenizer between policy and rm differs
+  return_raw_input_ids: False
   return_raw_chat: False
   n_samples: 1
   filter_accuracy: False
   filter_truncated: False
   accuracy_lower_bound: 0.0
   accuracy_upper_bound: 1.0
-  oversample_factor: 1.0 # Sample more responses than the batch size
+  oversample_factor: 1.0
   filter_format: True
   zero: False
   sample_num: -1
 
-# Recovery-Aware WMPO 总开关。
-# 默认 False，保证原始 WMPO / PPO 训练路径不额外产生 rec_* 字段，也不计算 L_rec。
-use_recovery_branch: False
-use_multi_resolution_reward: True
-reward:
-  clip_len: 8
-  img_size: 224
-  batch_size: 128
-reward_loc:
-  enable: True
-  require_dual_head_checkpoint: True
-  lambda_anchor: 1.0
-  lambda_rank: 0.5
-  lambda_fail: 0.5
-  lambda_smooth: 0.0
-  failed_tail_k: 2
-  rank_num_pairs: 2
-  progress_curve_bins: 5
-recovery:
-  # near-failure mining 的局部打分视界，单位是 imagined video 帧。
-  horizon_h: 16
-  # near-failure 只在 alpha < s_t < beta 的中间区间内寻找，避免把明显成功或明显失败点误判进去。
-  alpha: 0.15
-  beta: 0.85
-  # 比较局部成功分数下降时跨过的 policy 决策步数。
-  min_gap: 1
-  # 每个 near-failure state 采样的候选第一步动作数。
-  num_candidates: 4
-  # recovery search 只对“候选第一步动作”使用更强探索。
-  # 普通 imagined rollout 和候选动作之后的后续 policy rollout 仍沿用原 actor_rollout_ref.rollout.temperature。
-  candidate_temperature: 2.2
-  # 对支持 top-p/top-k 的 VLA 路径生效；openvla-oft 当前主要使用 temperature。
+use_dccp_branch: False
+
+scorer:
+  type: lrm
+
+  completion_endpoint: "http://127.0.0.1:8001/completion"
+  progress_endpoint: "http://127.0.0.1:8002/progress"
+
+  completion_batch_endpoint: null
+  progress_batch_endpoint: null
+
+  timeout_sec: 60
+  max_retries: 2
+  retry_sleep_sec: 1.0
+
+  use_cache: true
+  cache_dir: "./cache/lrm_scores"
+  jpeg_quality: 95
+
+lrm_input:
+  camera: "cam_high"
+  completion_num_keyframes: 8
+  progress_num_keyframes: 4
+  image_size: 224
+
+dccp:
+  horizon_H: 3
+  state_budget_per_traj: 2
+  nms_gap: 2
+
+  lambda_curvature: 1.0
+  lambda_entropy: 1.0
+  require_entropy: true
+
+  num_candidates: 8
+  max_branches_per_state: null
+
+  candidate_temperature: 1.0
   candidate_top_p: 1.0
   candidate_top_k: 0
-  # 固定候选第一步后，在 world model 中继续 rollout 的短视界长度。
-  recovery_horizon: 3
-  # 每个候选动作重复评估的 Monte Carlo 次数，用于降低 WM 随机性。
-  num_mc_samples: 2
-  # 构造 target 时参与 softmax/confidence 计算的正增益候选上限。
-  top_b: 1
-  # 候选动作本身的最低 recoverability 分数；低于该值不写入有效监督。
-  eps_recoverable: 0.0
-  # 相对 baseline 局部分数的最小正增益。
-  eps_gain: 0.01
-  # 构造 recovery target 时的 baseline 参照。
-  # current: 和当前边界状态 s_t 比较，较严格，容易因 s_t 接近 1 而没有正增益。
-  # future_min_gap: 和原轨迹继续走 min_gap 步后的 s_{t+min_gap} 比较，更符合 near-failure 的“未来退化”定义。
-  # future_min: 和边界状态之后所有局部分数的最小值比较，最宽松，主要用于调试。
-  target_baseline_mode: future_min_gap
-  # 对正增益候选做 softmax 的温度，越小越偏向最佳候选。
-  tau_gain: 0.1
-  # 总损失权重：L = L_base + lambda_rec * L_rec。
-  lambda_rec: 0.1
-  # 第一版默认每条轨迹最多挖一个 near-failure state，降低 rollout/search 开销。
-  max_states_per_traj: 1
-  # 每个 rollout batch 最多实际执行 local recovery search 的状态数。
-  # 这是运行时保护阈值：mining 仍会遍历轨迹，但超过该上限后不再启动昂贵的 WM 短视界搜索。
-  max_total_states_per_batch: 4
-  # search 内部每隔多少个候选/MC rollout 打一次进度日志；1 表示每个候选评估都打印。
-  search_log_every: 1
-  # 是否导出 recovery search 的可视化视频。默认关闭，避免正常训练产生大量视频文件。
-  export_videos: False
-  # 导出目录。实际写入时还会追加 global_step/rank/traj 等子目录。
-  export_dir: ./tmp_files/recovery_videos
-  # 每个 rollout batch 最多导出多少个有效 recovery target 的视频。
-  export_max_videos_per_batch: 2
-  # 是否额外导出“执行了 recovery search，但没有形成有效 target”的失败案例视频。
-  # 打开后会把 no_positive_gain / below_eps_recoverable 的最佳候选局部续写也保存下来，便于排查。
-  export_failed_search_videos: False
-  # 是否为所有挖到的 near-failure 状态单独导出原 imagined rollout 片段。
-  # 打开后，即使该状态因 state budget 被跳过、或 search 没形成有效 target，也会落盘原始轨迹视频。
-  export_all_near_failure_videos: False
-  # 是否为 complete=False 且没有挖到 near-failure 的失败 rollout 单独导出原 imagined 视频。
-  # 主要用于调试“失败轨迹为什么没触发 near-failure 规则”。
-  export_failed_rollout_videos: False
-  # 是否只对 reward model 判失败的 rollout 执行 near-failure mining/search。
-  # 打开后，complete=True 的 imagined rollout 不再参与 recovery 挖掘，可减少“明明整体成功却被判成 near-failure”的误报。
-  only_failed_rollouts: False
-  # 是否打印更细的 recovery 调试日志，例如每条 rollout 的 complete/finish_step、
-  # top drop 候选、selected near-failure 的前后局部分数等。
-  detailed_logging: False
-  # 导出 mp4 的帧率，仅影响可视化播放速度。
-  export_fps: 10
-  # 是否额外保存原始 imagined rollout 全程，便于和 recovery 纠偏视频对照。
-  export_full_original: True
+
+  margin_pos: 0.10
+  margin_neg: 0.10
+
+  max_pairs_per_state: null
+  max_pairs_per_rollout: 4
+  max_pairs_per_batch: 64
+
+  require_completion_score: true
+
+  beta_dpo: 0.1
+  lambda_pref: 0.3
+  lambda_pref_warmup_steps: 1000
+
+  discard_uniform_grpo_groups: true
 
 actor_rollout_ref:
-  # 将顶层 recovery 配置透传给 actor 和 rollout worker。
-  use_recovery_branch: ${use_recovery_branch}
-  use_multi_resolution_reward: ${use_multi_resolution_reward}
-  reward: ${reward}
-  reward_loc: ${reward_loc}
-  recovery: ${recovery}
+  use_dccp_branch: ${use_dccp_branch}
+  scorer: ${scorer}
+  lrm_input: ${lrm_input}
+  dccp: ${dccp}
+
   wm:
-    use_multi_resolution_reward: ${use_multi_resolution_reward}
-    reward: ${reward}
-    reward_loc: ${reward_loc}
     enable: False
     inference_config_path: ./configs/libero/inference/sdxl_simplevla.py
     train_config_path: ./configs/libero/train/sdxl_simplevla_web_mix.py
-    reward_model_path: ./checkpoints/SimpleVLA-RL/terminal_model/neg_cross_v1_3/best_videomae.pth
-    rm_threshold: 0.89
-    rm_img_size: ${reward.img_size}
+
   hybrid_engine: True
+
   model:
     vla: openvla-oft
     action_token_len: 7
@@ -134,64 +99,70 @@ actor_rollout_ref:
     override_config: { }
     enable_gradient_checkpointing: False
     use_remove_padding: False
-    lora_rank: 0  # Set to positive value to enable LoRA (e.g., 32)
-    lora_alpha: 32  # LoRA scaling factor
-    target_modules: all-linear  
-    # 可选：OpenVLA-OFT action 反归一化统计文件。
-    # 从 WMPO 保存的 merged actor checkpoint 继续训练时，目录里可能没有 dataset_statistics.json；
-    # 此时可以用这个路径显式指向原始 SFT checkpoint 里的 dataset_statistics.json。
+    lora_rank: 0
+    lora_alpha: 32
+    target_modules: all-linear
     dataset_statistics_path: null
+
   actor:
-    # actor 端只在 batch 中存在 rec_* 且该开关为 True 时计算 L_rec。
-    use_recovery_branch: ${use_recovery_branch}
-    recovery: ${recovery}
+    use_dccp_branch: ${use_dccp_branch}
+    dccp: ${dccp}
+
     vla: ${actor_rollout_ref.model.vla}
     action_token_len: ${actor_rollout_ref.model.action_token_len}
     action_chunks_len: ${actor_rollout_ref.model.action_chunks_len}
-    strategy: fsdp  # This is for backward-compatibility
+    strategy: fsdp
     traj_mini_batch_size: 16
     ppo_mini_batch_size: 256
     ppo_micro_batch_size: 64
     use_dynamic_bsz: False
     use_remove_padding: ${actor_rollout_ref.model.use_remove_padding}
-    ppo_max_token_len_per_gpu: 20480 # n * ${data.max_prompt_length} + ${data.max_response_length}
+    ppo_max_token_len_per_gpu: 20480
     grad_clip: 1.0
     clip_ratio_high: 0.28
     clip_ratio_low: 0.2
     entropy_coeff: 0.001
     ppo_epochs: 1
     shuffle: True
-    ulysses_sequence_parallel_size: 1 # sp size
+    ulysses_sequence_parallel_size: 1
     num_images_in_input: 1
+
     optim:
       lr: 1e-6
-      lr_warmup_steps_ratio: 0.  # the total steps will be injected during runtime
-      min_lr_ratio: null   # only useful for warmup with cosine
-      warmup_style: constant  # select from constant/cosine
-      total_training_steps: -1  # must be override by program
+      lr_warmup_steps_ratio: 0.
+      min_lr_ratio: null
+      warmup_style: constant
+      total_training_steps: -1
+
     fsdp_config:
       wrap_policy:
-        # transformer_layer_cls_to_wrap: None
         min_num_params: 0
       param_offload: False
       grad_offload: False
       optimizer_offload: False
       fsdp_size: -1
+
   ref:
+    use_dccp_branch: ${use_dccp_branch}
+    dccp: ${dccp}
+
     fsdp_config:
       param_offload: False
       wrap_policy:
-        # transformer_layer_cls_to_wrap: None
         min_num_params: 0
       fsdp_size: -1
+
     log_prob_micro_batch_size: 128
     log_prob_use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
     log_prob_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
-    ulysses_sequence_parallel_size: ${actor_rollout_ref.actor.ulysses_sequence_parallel_size} # sp size
+    ulysses_sequence_parallel_size: ${actor_rollout_ref.actor.ulysses_sequence_parallel_size}
+
   rollout:
-    # rollout 端只在 WM imagined rollout 中用该开关生成 recovery target。
-    use_recovery_branch: ${use_recovery_branch}
-    recovery: ${recovery}
+    use_dccp_branch: ${use_dccp_branch}
+    scorer: ${scorer}
+    lrm_input: ${lrm_input}
+    dccp: ${dccp}
+
     vla: ${actor_rollout_ref.model.vla}
     action_chunks_len: ${actor_rollout_ref.model.action_chunks_len}
     experiment_name: None
@@ -204,15 +175,15 @@ actor_rollout_ref:
     pretrained_checkpoint: None
     center_crop: True
     max_prompt_length: 512
-    num_images_in_input: 1  
+    num_images_in_input: 1
     name: vllm
     temperature: 1.0
-    top_k: -1 # 0 for hf rollout, -1 for vllm rollout
+    top_k: -1
     top_p: 1
-    prompt_length: ${data.max_prompt_length}  # not use for opensource
+    prompt_length: ${data.max_prompt_length}
     response_length: ${data.max_response_length}
-    # for vllm rollout
-    dtype: bfloat16 # should align with FSDP
+
+    dtype: bfloat16
     gpu_memory_utilization: 0.5
     ignore_eos: False
     enforce_eager: True
@@ -224,19 +195,19 @@ actor_rollout_ref:
     log_prob_micro_batch_size: 128
     log_prob_use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
     log_prob_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
-    # for hf rollout
+
     do_sample: True
-    # number of responses (i.e. num sample times)
-    n: 1 # > 1 for grpo
+    n: 1
 
 critic:
   strategy: fsdp
   optim:
     lr: 1e-5
-    lr_warmup_steps_ratio: 0.  # the total steps will be injected during runtime
-    min_lr_ratio: null   # only useful for warmup with cosine
-    warmup_style: constant  # select from constant/cosine
-    total_training_steps: -1  # must be override by program
+    lr_warmup_steps_ratio: 0.
+    min_lr_ratio: null
+    warmup_style: constant
+    total_training_steps: -1
+
   model:
     action_token_len: ${actor_rollout_ref.model.action_token_len}
     action_chunks_len: ${actor_rollout_ref.model.action_chunks_len}
@@ -246,100 +217,105 @@ critic:
     external_lib: ${actor_rollout_ref.model.external_lib}
     use_remove_padding: ${actor_rollout_ref.model.use_remove_padding}
     enable_gradient_checkpointing: ${actor_rollout_ref.model.enable_gradient_checkpointing}
+
     fsdp_config:
       param_offload: ${actor_rollout_ref.actor.fsdp_config.param_offload}
       grad_offload: ${actor_rollout_ref.actor.fsdp_config.grad_offload}
       optimizer_offload: ${actor_rollout_ref.actor.fsdp_config.optimizer_offload}
       wrap_policy:
-        # transformer_layer_cls_to_wrap: None
         min_num_params: 0
       fsdp_size: -1
-    lora_rank: 0  # Set to positive value to enable LoRA (e.g., 32)
-    lora_alpha: 32  # LoRA scaling factor
-    target_modules: all-linear 
-    type: value # if set to implicit, this will become an implicit PRM which updates according to gt. this only supports initializing from the reference model currently.
+
+    lora_rank: 0
+    lora_alpha: 32
+    target_modules: all-linear
+    type: value
+
   ppo_mini_batch_size: ${actor_rollout_ref.actor.ppo_mini_batch_size}
   ppo_micro_batch_size: 64
   forward_micro_batch_size: ${critic.ppo_micro_batch_size}
   use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
-  ppo_max_token_len_per_gpu: 32768 # (${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}) * 2
+  ppo_max_token_len_per_gpu: 32768
   forward_max_token_len_per_gpu: ${critic.ppo_max_token_len_per_gpu}
-  ulysses_sequence_parallel_size: ${actor_rollout_ref.actor.ulysses_sequence_parallel_size} # sp size
+  ulysses_sequence_parallel_size: ${actor_rollout_ref.actor.ulysses_sequence_parallel_size}
   ppo_epochs: ${actor_rollout_ref.actor.ppo_epochs}
   shuffle: ${actor_rollout_ref.actor.shuffle}
   grad_clip: 1.0
   cliprange_value: 0.5
 
-# verifier is more than source of reward. so it should be independent
 verifier:
   type: prime
-#  timeout: 5
-#  num_processes: 64
   reward_coef: 5
 
 reward_model:
   enable: True
   strategy: fsdp
+
   model:
     action_token_len: ${actor_rollout_ref.model.action_token_len}
     action_chunks_len: ${actor_rollout_ref.model.action_chunks_len}
-    input_tokenizer: ${actor_rollout_ref.model.path}  # set this to null if the chat template is identical
+    input_tokenizer: ${actor_rollout_ref.model.path}
     path: ~/models/FsfairX-LLaMA3-RM-v0.1
     external_lib: ${actor_rollout_ref.model.external_lib}
-    use_remove_padding:  ${actor_rollout_ref.model.use_remove_padding}
+    use_remove_padding: ${actor_rollout_ref.model.use_remove_padding}
+
     fsdp_config:
       min_num_params: 0
       param_offload: False
+
   mini_batch_size: ${actor_rollout_ref.actor.ppo_mini_batch_size}
   micro_batch_size: 64
   max_length: null
-  ulysses_sequence_parallel_size: ${actor_rollout_ref.actor.ulysses_sequence_parallel_size} # sp size
+  ulysses_sequence_parallel_size: ${actor_rollout_ref.actor.ulysses_sequence_parallel_size}
   use_dynamic_bsz: ${critic.use_dynamic_bsz}
   ppo_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
   forward_max_token_len_per_gpu: ${critic.forward_max_token_len_per_gpu}
-  rm_coef: 0 # weight for the reward model
-  rm_type: prime # set to prime for process reward
-  # configurations for process rewards of prime
-  prime_granularity: token # whole
-  prime_norm: batch_norm # batch_norm or none. if set to none, the normalizer is beta_train
+  rm_coef: 0
+  rm_type: prime
+  prime_granularity: token
+  prime_norm: batch_norm
+
   prime_model:
     input_tokenizer: ${actor_rollout_ref.model.path}
-    path: /home/wangzefan/huggingface/dpo-prm
-    ref_type: freeze # policy
-    ref_path: /data/public/wangshuo/LongContext/model/meta-llama/Llama3.1-8b-instruct
+    path: /data_jiang/wl/DCCP/prime_model
+    ref_type: freeze
+    ref_path: /data_jiang/wl/DCCP/reference_model
     external_lib: ${actor_rollout_ref.model.external_lib}
     enable_gradient_checkpointing: ${actor_rollout_ref.model.enable_gradient_checkpointing}
-    use_remove_padding:  ${actor_rollout_ref.model.use_remove_padding}
+    use_remove_padding: ${actor_rollout_ref.model.use_remove_padding}
+
     fsdp_config:
       wrap_policy:
         min_num_params: 0
       param_offload: ${actor_rollout_ref.actor.fsdp_config.param_offload}
       grad_offload: ${actor_rollout_ref.actor.fsdp_config.grad_offload}
       optimizer_offload: ${actor_rollout_ref.actor.fsdp_config.optimizer_offload}
-    update: none #before, after, or none
+
+    update: none
+
     optim:
       lr: 1e-6
       lr_warmup_steps_ratio: 0.
       min_lr_ratio: null
       warmup_style: constant
-      total_training_steps: -1  # must be override by program
+      total_training_steps: -1
       weight_decay: 0.
       grad_clip: 1.0
+
     beta_train: 0.05
-    loss_type: ce # currently only supports ce loss
-
-
+    loss_type: ce
 
 algorithm:
   gamma: 1.0
   lam: 1.0
   adv_estimator: gae
-  # now supports rloo. it treats different source of reward separately.
-  # TODO: it should also support different gamma for different rewards.
+
   adv_params:
     verifier_gamma: ${algorithm.gamma}
     reward_model_gamma: ${algorithm.gamma}
-  kl_penalty: kl  # how to estimate kl divergence
+
+  kl_penalty: kl
+
   kl_ctrl:
     type: fixed
     kl_coef: 0.001

@@ -1,0 +1,22 @@
+scorer:
+  type: lrm
+
+  completion_endpoint: "http://127.0.0.1:8001/completion"
+  progress_endpoint: "http://127.0.0.1:8002/progress"
+
+  completion_batch_endpoint: null
+  progress_batch_endpoint: null
+
+  timeout_sec: 60
+  max_retries: 2
+  retry_sleep_sec: 1.0
+
+  use_cache: true
+  cache_dir: "./cache/lrm_scores"
+  jpeg_quality: 95
+
+lrm_input:
+  camera: "cam_high"
+  completion_num_keyframes: 8
+  progress_num_keyframes: 4
+  image_size: 224

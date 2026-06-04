@@ -20,6 +20,7 @@ from typing import Iterable, Tuple
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 import torch.distributed as dist
 
@@ -27,6 +28,7 @@ import torch.distributed as dist
 from verl import DataProto
 from verl.trainer.ppo import core_algos
 from verl.workers.actor import BasePPOActor
+from verl.utils.dccp_schema import PREF_KEYS
 from verl.utils.py_functional import append_to_dict
 from verl.utils.torch_functional import logprobs_from_logits, log_probs_from_logits_all_rmpad
 from verl.utils.seqlen_balancing import rearrange_micro_batches, get_reverse_idx
@@ -386,82 +388,161 @@ class RobDataParallelPPOActor(BasePPOActor):
 
         return log_probs
 
-    def _compute_recovery_loss(self, data, temperature):
-        """计算 recovery 分支的动作级监督损失。
+    def _forward_dccp_sequence_logprob(
+        self,
+        input_ids,
+        attention_mask,
+        pixel_values,
+        responses,
+        response_mask,
+        temperature,
+    ):
+        """计算一组 action responses 的 sequence logprob"""
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            input_ids_unpad, _ = self.process_tensor(input_ids, self.pad_token_id)
+            attention_mask_unpad, _ = self.process_tensor(attention_mask, 0)
 
-        公式为 L_rec = - E[c_t * log pi_theta(a_star | x_t, lang)]。
-        这里的 x_t/lang 对应 rec_input_ids/rec_attention_mask/rec_pixel_values，
-        a_star 对应 rec_responses，c_t 对应 rec_confidence。
-        """
-        # baseline batch 不含 rec_* 字段，或者配置关闭时，完全跳过 recovery 分支。
-        if not self.config.get("use_recovery_branch", False) or "rec_valid" not in data.keys():
+            if self.config.vla == "openvla-oft":
+                logits = self.actor_module(
+                    input_ids=input_ids_unpad,
+                    attention_mask=attention_mask_unpad,
+                    pixel_values=pixel_values,
+                )
+
+                assert self.actor_module.vocab_size == 32000
+                start_index = self.actor_module.vocab_size - 256
+                logits = logits[..., -256 - 64:-64]
+                target_responses = responses - start_index
+
+            elif self.config.vla == "openvla":
+                output = self.actor_module(
+                    input_ids=input_ids_unpad,
+                    attention_mask=attention_mask_unpad,
+                    pixel_values=pixel_values,
+                    use_cache=False,
+                )
+                logits = output.logits
+                response_length = responses.size(-1)
+                logits = logits[:, -response_length - 1:-1]
+                target_responses = responses
+
+            else:
+                raise NotImplementedError(f"Unsupported VLA type for DCCP preference loss: {self.config.vla}")
+
+            logits = logits.div(temperature)
+            token_logprobs = logprobs_from_logits(logits, target_responses)
+            token_logprobs = token_logprobs * response_mask.float()
+            return token_logprobs.reshape(token_logprobs.shape[0], -1).sum(dim=-1)
+
+    def _get_dccp_lambda_pref(self, global_steps):
+        """计算 DCCP preference loss 的当前权重"""
+        dccp_cfg = self.config.get("dccp", {})
+        lambda_pref = float(dccp_cfg.get("lambda_pref", 0.3))
+        warmup_steps = int(dccp_cfg.get("lambda_pref_warmup_steps", 0))
+
+        if warmup_steps <= 0:
+            return lambda_pref
+
+        progress = min(max(float(global_steps) / float(warmup_steps), 0.0), 1.0)
+        return lambda_pref * progress
+
+    def _flatten_pref_tensor(self, tensor, valid_ndim):
+        """将 pref tensor 的样本维展开，保留每个样本内部维度"""
+        return tensor.reshape((-1,) + tuple(tensor.shape[valid_ndim:]))
+
+    def _compute_dccp_pref_loss(self, data, temperature, global_steps=0):
+        """计算 DCCP local DPO-style preference loss"""
+        if not self.config.get("use_dccp_branch", False) or PREF_KEYS.valid not in data.keys():
             return None, {}
 
-        # rec_valid 将 [batch, max_states_per_traj] 拉平成一维，只训练有效 target。
-        rec_valid = data["rec_valid"].reshape(-1).bool()
-        num_valid = int(rec_valid.sum().item())
-        # FSDP 下所有 rank 必须执行相同次数的 forward/all-gather。
-        # recovery target 是按轨迹挖出来的，不同 rank 的本地 microbatch 里有效 target 数可能不同。
-        # 如果直接按本地 num_valid 循环 forward，某些 rank 会多进/少进 FSDP forward，
-        # 最终表现为 NCCL _ALLGATHER_BASE 等待超时，而 Ray 只会看到 ActorDiedError。
-        global_valid = torch.tensor([num_valid], dtype=torch.long, device=rec_valid.device)
+        pref_valid = data[PREF_KEYS.valid].bool()
+        valid_ndim = pref_valid.ndim
+        flat_valid = pref_valid.reshape(-1)
+        num_valid = int(flat_valid.sum().item())
+
+        global_valid = torch.tensor([num_valid], dtype=torch.long, device=flat_valid.device)
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(global_valid, op=dist.ReduceOp.MAX)
         max_valid_across_ranks = int(global_valid.item())
+
         metrics = {
-            "recovery/num_valid_targets": num_valid,
-            "recovery/num_candidates": 0.0,
-            "recovery/confidence_mean": 0.0,
-            "recovery/gain_mean": 0.0,
-            "loss/recovery": 0.0,
+            "dccp/valid_pairs_actor": float(num_valid),
+            "dccp/pref_weight_mean_actor": 0.0,
+            "dccp/margin_mean_actor": 0.0,
+            "dccp/delta_ref_mean_actor": 0.0,
+            "dccp/delta_theta_mean_actor": 0.0,
+            "dccp/logp_winner_mean": 0.0,
+            "dccp/logp_loser_mean": 0.0,
+            "dccp/lambda_pref": float(self._get_dccp_lambda_pref(global_steps)),
+            "loss/dccp_pref": 0.0,
         }
+
         if max_valid_across_ranks == 0:
             return None, metrics
 
         if num_valid > 0:
-            # 将每条轨迹的多个 recovery slot 展平成样本维度，再按 rec_valid 过滤。
-            input_ids = data["rec_input_ids"].reshape((-1,) + tuple(data["rec_input_ids"].shape[2:]))[rec_valid]
-            attention_mask = data["rec_attention_mask"].reshape((-1,) + tuple(data["rec_attention_mask"].shape[2:]))[rec_valid]
-            pixel_values = data["rec_pixel_values"].reshape((-1,) + tuple(data["rec_pixel_values"].shape[2:]))[rec_valid]
-            responses = data["rec_responses"].reshape((-1,) + tuple(data["rec_responses"].shape[2:]))[rec_valid]
-            confidence = data["rec_confidence"].reshape(-1)[rec_valid].float()
-            gain = data["rec_gain"].reshape(-1)[rec_valid].float()
-            num_candidates = data["rec_num_candidates"].reshape(-1)[rec_valid].float()
-        else:
-            # 本 rank 没有有效 recovery target，但其他 rank 有。
-            # 为了保持 FSDP collective 次数一致，仍然用一个普通 policy 样本做 dummy forward；
-            # confidence/gain 置 0，保证它不贡献 recovery 梯度。
-            input_ids = data["input_ids"].reshape((-1,) + tuple(data["input_ids"].shape[2:]))[:1]
-            attention_mask = data["attention_mask"].reshape((-1,) + tuple(data["attention_mask"].shape[2:]))[:1]
-            pixel_values = data["pixel_values"].reshape((-1,) + tuple(data["pixel_values"].shape[2:]))[:1]
-            responses = data["responses"].reshape((-1,) + tuple(data["responses"].shape[2:]))[:1]
-            confidence = torch.zeros((1,), dtype=torch.float32, device=rec_valid.device)
-            gain = torch.zeros((1,), dtype=torch.float32, device=rec_valid.device)
-            num_candidates = torch.zeros((1,), dtype=torch.float32, device=rec_valid.device)
+            pref_input_ids = self._flatten_pref_tensor(data[PREF_KEYS.input_ids], valid_ndim)[flat_valid]
+            pref_attention_mask = self._flatten_pref_tensor(data[PREF_KEYS.attention_mask], valid_ndim)[flat_valid]
+            pref_pixel_values = self._flatten_pref_tensor(data[PREF_KEYS.pixel_values], valid_ndim)[flat_valid]
+            winner_responses = self._flatten_pref_tensor(data[PREF_KEYS.winner_responses], valid_ndim)[flat_valid]
+            loser_responses = self._flatten_pref_tensor(data[PREF_KEYS.loser_responses], valid_ndim)[flat_valid]
+            response_mask = self._flatten_pref_tensor(data[PREF_KEYS.response_mask], valid_ndim)[flat_valid].bool()
 
-        # 复用已有 action token log_prob 前向，避免为 recovery 单独实现一套 action head 接口。
-        # 这里一次性 batched forward，而不是按 target 循环 forward；这既更快，也避免不同 rank
-        # 因本地 target 数量不同而执行不同次数的 FSDP all-gather。
-        _, log_prob = self._forward_micro_batch_update(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            pixel_values=pixel_values,
-            responses=responses,
+            pref_weight = data[PREF_KEYS.weight].reshape(-1)[flat_valid].float()
+            pref_delta_ref = data[PREF_KEYS.delta_ref].reshape(-1)[flat_valid].float()
+            pref_margin = data[PREF_KEYS.margin].reshape(-1)[flat_valid].float()
+        else:
+            pref_input_ids = data["input_ids"].reshape((-1,) + tuple(data["input_ids"].shape[2:]))[:1]
+            pref_attention_mask = data["attention_mask"].reshape((-1,) + tuple(data["attention_mask"].shape[2:]))[:1]
+            pref_pixel_values = data["pixel_values"].reshape((-1,) + tuple(data["pixel_values"].shape[2:]))[:1]
+            winner_responses = data["responses"].reshape((-1,) + tuple(data["responses"].shape[2:]))[:1]
+            loser_responses = winner_responses.clone()
+            response_mask = torch.ones_like(winner_responses, dtype=torch.bool, device=winner_responses.device)
+
+            pref_weight = torch.zeros((1,), dtype=torch.float32, device=flat_valid.device)
+            pref_delta_ref = torch.zeros((1,), dtype=torch.float32, device=flat_valid.device)
+            pref_margin = torch.zeros((1,), dtype=torch.float32, device=flat_valid.device)
+
+        winner_logprob = self._forward_dccp_sequence_logprob(
+            input_ids=pref_input_ids,
+            attention_mask=pref_attention_mask,
+            pixel_values=pref_pixel_values,
+            responses=winner_responses,
+            response_mask=response_mask,
             temperature=temperature,
         )
-        target_log_probs = log_prob.reshape(log_prob.shape[0], -1).sum(dim=-1)
-        # confidence 是 target 构造时的 c_t；越不确定的 target 对 loss 的贡献越小。
-        recovery_loss = -(confidence * target_log_probs).mean()
 
-        metrics.update(
-            {
-                "recovery/num_candidates": num_candidates.mean().detach().item(),
-                "recovery/confidence_mean": confidence.mean().detach().item(),
-                "recovery/gain_mean": gain.mean().detach().item(),
-                "loss/recovery": recovery_loss.detach().item(),
-            }
+        loser_logprob = self._forward_dccp_sequence_logprob(
+            input_ids=pref_input_ids,
+            attention_mask=pref_attention_mask,
+            pixel_values=pref_pixel_values,
+            responses=loser_responses,
+            response_mask=response_mask,
+            temperature=temperature,
         )
-        return recovery_loss, metrics
+
+        delta_theta = winner_logprob - loser_logprob
+        beta_dpo = float(self.config.get("dccp", {}).get("beta_dpo", 0.1))
+        logits = beta_dpo * (delta_theta - pref_delta_ref.to(delta_theta.device))
+
+        raw_loss = -F.logsigmoid(logits)
+        weight = pref_weight.to(raw_loss.device).float()
+        dccp_pref_loss = (weight * raw_loss).sum() / weight.sum().clamp_min(1.0)
+
+        if num_valid > 0:
+            metrics.update(
+                {
+                    "dccp/pref_weight_mean_actor": pref_weight.mean().detach().item(),
+                    "dccp/margin_mean_actor": pref_margin.mean().detach().item(),
+                    "dccp/delta_ref_mean_actor": pref_delta_ref.mean().detach().item(),
+                    "dccp/delta_theta_mean_actor": delta_theta.detach().mean().item(),
+                    "dccp/logp_winner_mean": winner_logprob.detach().mean().item(),
+                    "dccp/logp_loser_mean": loser_logprob.detach().mean().item(),
+                    "loss/dccp_pref": dccp_pref_loss.detach().item(),
+                }
+            )
+
+        return dccp_pref_loss, metrics
 
     def update_policy(self, data: DataProto):
         self.actor_module.train()
@@ -470,20 +551,29 @@ class RobDataParallelPPOActor(BasePPOActor):
         self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size
         temperature = data.meta_info['temperature']  # temperature must be in the data.meta_info to avoid slient error
         self.pad_token_id = data.meta_info.get('pad_token_id', getattr(self, 'pad_token_id', None))
+        global_steps = int(data.meta_info.get('global_steps', 0))
 
-        select_keys = ['responses', 'input_ids', 'attention_mask', 'pixel_values', 'old_log_probs', 'advantages',"finish_step"]
-        # recovery 字段是可选字段：关闭 recovery 或非 WM rollout 时不会出现在 batch 中。
-        recovery_keys = [
-            "rec_input_ids",
-            "rec_attention_mask",
-            "rec_pixel_values",
-            "rec_responses",
-            "rec_confidence",
-            "rec_gain",
-            "rec_num_candidates",
-            "rec_valid",
+        select_keys = ['responses', 'input_ids', 'attention_mask', 'pixel_values', 'old_log_probs', 'advantages', "finish_step"]
+
+        dccp_keys = [
+            PREF_KEYS.input_ids,
+            PREF_KEYS.attention_mask,
+            PREF_KEYS.pixel_values,
+            PREF_KEYS.winner_responses,
+            PREF_KEYS.loser_responses,
+            PREF_KEYS.response_mask,
+            PREF_KEYS.weight,
+            PREF_KEYS.delta_ref,
+            PREF_KEYS.margin,
+            PREF_KEYS.valid,
+            PREF_KEYS.nominal_score,
+            PREF_KEYS.alternative_score,
+            PREF_KEYS.entropy,
+            PREF_KEYS.curvature,
+            PREF_KEYS.state_index,
+            PREF_KEYS.candidate_index,
         ]
-        select_keys = select_keys + [key for key in recovery_keys if key in data.batch.keys()]
+        select_keys = select_keys + [key for key in dccp_keys if key in data.batch.keys()]
         batch = data.select(batch_keys=select_keys).batch
         assert self.config.ppo_micro_batch_size == 1
 
@@ -583,15 +673,17 @@ class RobDataParallelPPOActor(BasePPOActor):
                     loss_info['actor/pg_clipfrac'] = loss_info['actor/pg_clipfrac'] + pg_clipfrac.detach().item()
                     loss_info['actor/ppo_kl'] = loss_info['actor/ppo_kl'] +  ppo_kl.detach().item()
 
-                recovery_loss, recovery_info = self._compute_recovery_loss(data, temperature=temperature)
-                if recovery_info:
-                    for key, value in recovery_info.items():
+                dccp_pref_loss, dccp_info = self._compute_dccp_pref_loss(
+                    data=data,
+                    temperature=temperature,
+                    global_steps=global_steps,
+                )
+                if dccp_info:
+                    for key, value in dccp_info.items():
                         loss_info[key] = loss_info.get(key, 0) + value
-                if recovery_loss is not None:
-                    # 与 PPO policy loss 累加到同一个 optimizer step：
-                    # L = L_base + lambda_rec * L_rec。
-                    lambda_rec = float(self.config.get("recovery", {}).get("lambda_rec", 0.0))
-                    (lambda_rec * recovery_loss / self.gradient_accumulation).backward()
+                if dccp_pref_loss is not None:
+                    lambda_pref = self._get_dccp_lambda_pref(global_steps)
+                    (lambda_pref * dccp_pref_loss / self.gradient_accumulation).backward()
 
                 append_to_dict(metrics, loss_info)
                

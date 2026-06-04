@@ -212,27 +212,39 @@ def reduce_metrics(metrics: dict):
     return metrics
 
 
-def summarize_recovery_tensors(batch):
-    """汇总 batch 中的 recovery target 状态，便于训练主循环打印和记录日志。"""
-    if 'rec_valid' not in batch.keys():
+def summarize_dccp_tensors(batch):
+    """汇总 batch 中的 DCCP preference 状态"""
+    if 'pref_valid' not in batch.keys():
         return {
             'slots': 0,
             'valid': 0,
-            'confidence_sum': 0.0,
-            'gain_sum': 0.0,
+            'margin_sum': 0.0,
+            'margin_abs_sum': 0.0,
+            'weight_sum': 0.0,
+            'delta_ref_sum': 0.0,
         }
 
-    rec_valid = batch['rec_valid'].bool()
-    valid_count = int(rec_valid.sum().item())
+    pref_valid = batch['pref_valid'].bool()
+    valid_count = int(pref_valid.sum().item())
     summary = {
-        'slots': int(rec_valid.numel()),
+        'slots': int(pref_valid.numel()),
         'valid': valid_count,
-        'confidence_sum': 0.0,
-        'gain_sum': 0.0,
+        'margin_sum': 0.0,
+        'margin_abs_sum': 0.0,
+        'weight_sum': 0.0,
+        'delta_ref_sum': 0.0,
     }
+
     if valid_count > 0:
-        summary['confidence_sum'] = float(batch['rec_confidence'][rec_valid].float().sum().item())
-        summary['gain_sum'] = float(batch['rec_gain'][rec_valid].float().sum().item())
+        margin = batch['pref_margin'][pref_valid].float()
+        weight = batch['pref_weight'][pref_valid].float()
+        delta_ref = batch['pref_delta_ref'][pref_valid].float()
+
+        summary['margin_sum'] = float(margin.sum().item())
+        summary['margin_abs_sum'] = float(margin.abs().sum().item())
+        summary['weight_sum'] = float(weight.sum().item())
+        summary['delta_ref_sum'] = float(delta_ref.sum().item())
+
     return summary
 
 
@@ -589,10 +601,12 @@ class RayTrainer(object):
                 collection_rounds = 0
                 generated_rollouts = 0
                 kept_rollouts = 0
-                recovery_slots_seen = 0
-                recovery_valid_seen = 0
-                recovery_confidence_sum = 0.0
-                recovery_gain_sum = 0.0
+                dccp_slots_seen = 0
+                dccp_valid_seen = 0
+                dccp_margin_sum = 0.0
+                dccp_margin_abs_sum = 0.0
+                dccp_weight_sum = 0.0
+                dccp_delta_ref_sum = 0.0
 
                 while len(valid_batch) < batch_size * n_samples:
                     collection_rounds += 1
@@ -603,7 +617,7 @@ class RayTrainer(object):
                         f"train_batch={batch_size} n_samples={n_samples} "
                         f"adv={self.config.algorithm.adv_estimator} "
                         f"use_wm={self.config.actor_rollout_ref.wm.enable} "
-                        f"use_recovery={self.config.get('use_recovery_branch', False)}"
+                        f"use_dccp={self.config.get('use_dccp_branch', False)}"
                     )
                     
 
@@ -625,6 +639,7 @@ class RayTrainer(object):
                             'n_samples': n_samples,
                             'pad_token_id': self.tokenizer.pad_token_id,
                             'use_wm': self.config.actor_rollout_ref.wm.enable,
+                            'global_steps': global_steps,
                             # 'rollout_base_dir': self.config.actor_rollout_ref.rollout_base_dir,
                             # 'save_to_hdfs': True,
                             # 'return_rollouts': True
@@ -634,18 +649,20 @@ class RayTrainer(object):
                         #roll_batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
                         roll_batch = roll_batch.union(gen_batch_output)
                         generated_rollouts += len(roll_batch)
-                        recovery_summary = summarize_recovery_tensors(roll_batch.batch)
-                        recovery_slots_seen += recovery_summary['slots']
-                        recovery_valid_seen += recovery_summary['valid']
-                        recovery_confidence_sum += recovery_summary['confidence_sum']
-                        recovery_gain_sum += recovery_summary['gain_sum']
+                        dccp_summary = summarize_dccp_tensors(roll_batch.batch)
+                        dccp_slots_seen += dccp_summary['slots']
+                        dccp_valid_seen += dccp_summary['valid']
+                        dccp_margin_sum += dccp_summary['margin_sum']
+                        dccp_margin_abs_sum += dccp_summary['margin_abs_sum']
+                        dccp_weight_sum += dccp_summary['weight_sum']
+                        dccp_delta_ref_sum += dccp_summary['delta_ref_sum']
                         complete_mean = roll_batch.batch['complete'].float().mean().item() if 'complete' in roll_batch.batch.keys() else 0.0
                         finish_mean = roll_batch.batch['finish_step'].float().mean().item() if 'finish_step' in roll_batch.batch.keys() else 0.0
                         print(
                             "[rollout-generated] "
                             f"round={collection_rounds} generated={len(roll_batch)} "
                             f"complete_mean={complete_mean:.4f} finish_step_mean={finish_mean:.2f} "
-                            f"recovery_valid={recovery_summary['valid']}/{recovery_summary['slots']}"
+                            f"dccp_valid={dccp_summary['valid']}/{dccp_summary['slots']}"
                         )
 
                     metrics['timing/gen'] += timer.last
@@ -719,17 +736,21 @@ class RayTrainer(object):
                         f"target_rollouts={batch_size * n_samples} "
                         f"generated={generated_rollouts} kept={kept_rollouts}"
                     )
-                if recovery_slots_seen > 0:
-                    metrics['recovery/rollout_slots'] = recovery_slots_seen
-                    metrics['recovery/rollout_valid_targets'] = recovery_valid_seen
-                    metrics['recovery/rollout_valid_ratio'] = recovery_valid_seen / max(recovery_slots_seen, 1)
-                    metrics['recovery/rollout_confidence_mean'] = recovery_confidence_sum / max(recovery_valid_seen, 1)
-                    metrics['recovery/rollout_gain_mean'] = recovery_gain_sum / max(recovery_valid_seen, 1)
+                if dccp_slots_seen > 0:
+                    metrics['dccp/rollout_slots'] = dccp_slots_seen
+                    metrics['dccp/valid_pairs_rollout'] = dccp_valid_seen
+                    metrics['dccp/valid_pair_ratio'] = dccp_valid_seen / max(dccp_slots_seen, 1)
+                    metrics['dccp/margin_mean'] = dccp_margin_sum / max(dccp_valid_seen, 1)
+                    metrics['dccp/margin_abs_mean'] = dccp_margin_abs_sum / max(dccp_valid_seen, 1)
+                    metrics['dccp/pref_weight_mean'] = dccp_weight_sum / max(dccp_valid_seen, 1)
+                    metrics['dccp/delta_ref_mean'] = dccp_delta_ref_sum / max(dccp_valid_seen, 1)
                     print(
-                        "[recovery-collect] "
-                        f"valid_targets={recovery_valid_seen}/{recovery_slots_seen} "
-                        f"confidence_mean={metrics['recovery/rollout_confidence_mean']:.4f} "
-                        f"gain_mean={metrics['recovery/rollout_gain_mean']:.4f}"
+                        "[dccp-collect] "
+                        f"valid_pairs={dccp_valid_seen}/{dccp_slots_seen} "
+                        f"margin_mean={metrics['dccp/margin_mean']:.4f} "
+                        f"weight_mean={metrics['dccp/pref_weight_mean']:.4f} "
+                        f"delta_ref_mean={metrics['dccp/delta_ref_mean']:.4f}",
+                        flush=True,
                     )
 
                 for k, v in reward_metrics.items():
@@ -794,6 +815,7 @@ class RayTrainer(object):
                     with Timer(name='update_actor', text="{name}: {seconds:.1f} seconds") as timer:
                         batch.meta_info['is_filtered'] = True
                         batch.meta_info['train_mode'] = False
+                        batch.meta_info['global_steps'] = global_steps
                         actor_output = self.actor_rollout_wg.update_actor(batch)
                         entropy_output = self.actor_rollout_wg.compute_entropy(data=batch)
                     metrics['timing/update_actor'] = timer.last
