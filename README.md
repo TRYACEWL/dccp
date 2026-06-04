@@ -527,14 +527,6 @@ A recommended reading order is:
 
 For implementation-change details and A/B handoff information, see the accompanying code-change document.
 
-## ⚠️ Resource Notes
-
-DCCP training with real LRM scoring requires both completion and progress endpoints to be online.
-
-If only one GPU is available for LRM inference, completion and progress can be validated separately. A full real-LRM training smoke test requires enough GPU memory to keep both endpoints available, or requires moving one endpoint to another machine.
-
-For engineering smoke tests, a dummy server may be used to validate the `DCCPScorer -> pref_* -> actor loss` path, but dummy scores must not be used for paper results.
-
 ## 🙏 Acknowledgement
 
 This repository builds on the WMPO training framework and adapts several open-source components for DCCP research. We thank the authors and maintainers of:
