@@ -35,6 +35,7 @@ from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl import DataProto
 from verl.trainer.ppo import core_algos
 from verl.utils.dataset.rob_dataset import BufferedDataLoader
+from verl.utils.dccp_schema import PREF_KEYS
 
 from tqdm import tqdm
 
@@ -211,10 +212,28 @@ def reduce_metrics(metrics: dict):
         metrics[key] = np.mean(val)
     return metrics
 
+def _get_batch_tensor(batch, *keys):
+    for key in keys:
+        if key in batch.keys():
+            return batch[key]
+    return None
+
+def _flatten_pref_scalar_for_valid(tensor, pref_valid):
+    if tensor is None:
+        return None
+    valid_ndim = pref_valid.ndim
+    flat_valid = pref_valid.reshape(-1)
+    if tensor.ndim == valid_ndim:
+        flat_tensor = tensor.reshape(-1)
+    else:
+        flat_tensor = tensor.reshape((-1,) + tuple(tensor.shape[valid_ndim:])).reshape(flat_valid.numel(), -1)[:, 0]
+    return flat_tensor[flat_valid]
+
 
 def summarize_dccp_tensors(batch):
     """汇总 batch 中的 DCCP preference 状态"""
-    if 'pref_valid' not in batch.keys():
+    pref_valid = _get_batch_tensor(batch, 'pref_valid')
+    if pref_valid is None:
         return {
             'slots': 0,
             'valid': 0,
@@ -224,7 +243,7 @@ def summarize_dccp_tensors(batch):
             'delta_ref_sum': 0.0,
         }
 
-    pref_valid = batch['pref_valid'].bool()
+    pref_valid = pref_valid.bool()
     valid_count = int(pref_valid.sum().item())
     summary = {
         'slots': int(pref_valid.numel()),
@@ -236,14 +255,22 @@ def summarize_dccp_tensors(batch):
     }
 
     if valid_count > 0:
-        margin = batch['pref_margin'][pref_valid].float()
-        weight = batch['pref_weight'][pref_valid].float()
-        delta_ref = batch['pref_delta_ref'][pref_valid].float()
+        margin = _flatten_pref_scalar_for_valid(_get_batch_tensor(batch, 'pref_margin'), pref_valid)
+        weight = _flatten_pref_scalar_for_valid(_get_batch_tensor(batch, 'pref_weight'), pref_valid)
+        delta_ref = _flatten_pref_scalar_for_valid(_get_batch_tensor(batch, 'pref_delta_ref'), pref_valid)
 
-        summary['margin_sum'] = float(margin.sum().item())
-        summary['margin_abs_sum'] = float(margin.abs().sum().item())
-        summary['weight_sum'] = float(weight.sum().item())
-        summary['delta_ref_sum'] = float(delta_ref.sum().item())
+        if margin is not None:
+            margin = margin.float()
+            summary['margin_sum'] = float(margin.sum().item())
+            summary['margin_abs_sum'] = float(margin.abs().sum().item())
+        if weight is not None:
+            weight = weight.float()
+            summary['weight_sum'] = float(weight.sum().item())
+        elif margin is not None:
+            summary['weight_sum'] = float(margin.abs().sum().item())
+        if delta_ref is not None:
+            delta_ref = delta_ref.float()
+            summary['delta_ref_sum'] = float(delta_ref.sum().item())
 
     return summary
 
@@ -305,7 +332,13 @@ class RayTrainer(object):
 
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
-        self.use_reference_policy = Role.RefPolicy in role_worker_mapping and config.algorithm.kl_ctrl.kl_coef > 0
+        dccp_cfg = config.get('dccp', {}) or {}
+        self.use_dccp_ref_gap = bool(config.get('use_dccp_branch', False)) and bool(dccp_cfg.get('use_ref_gap', True))
+        self.use_reference_policy = Role.RefPolicy in role_worker_mapping and (
+            config.algorithm.kl_ctrl.kl_coef > 0 or self.use_dccp_ref_gap
+        )
+        if self.use_dccp_ref_gap and Role.RefPolicy not in role_worker_mapping:
+            raise ValueError("DCCP use_ref_gap=True requires Role.RefPolicy to compute pref_delta_ref")
         self.use_rm = Role.RewardModel in role_worker_mapping
         self.ray_worker_group_cls = ray_worker_group_cls
 
@@ -648,6 +681,9 @@ class RayTrainer(object):
                         roll_batch = DataProto.concat(batch_lst)
                         #roll_batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
                         roll_batch = roll_batch.union(gen_batch_output)
+                        if self.use_dccp_ref_gap and PREF_KEYS.valid in roll_batch.batch.keys():
+                            dccp_ref_gap = self.ref_policy_wg.compute_dccp_ref_gap(roll_batch)
+                            roll_batch.batch[PREF_KEYS.delta_ref] = dccp_ref_gap.batch[PREF_KEYS.delta_ref]
                         generated_rollouts += len(roll_batch)
                         dccp_summary = summarize_dccp_tensors(roll_batch.batch)
                         dccp_slots_seen += dccp_summary['slots']
@@ -736,7 +772,7 @@ class RayTrainer(object):
                         f"target_rollouts={batch_size * n_samples} "
                         f"generated={generated_rollouts} kept={kept_rollouts}"
                     )
-                if dccp_slots_seen > 0:
+                if dccp_slots_seen > 0 or self.config.get('use_dccp_branch', False):
                     metrics['dccp/rollout_slots'] = dccp_slots_seen
                     metrics['dccp/valid_pairs_rollout'] = dccp_valid_seen
                     metrics['dccp/valid_pair_ratio'] = dccp_valid_seen / max(dccp_slots_seen, 1)
@@ -744,6 +780,8 @@ class RayTrainer(object):
                     metrics['dccp/margin_abs_mean'] = dccp_margin_abs_sum / max(dccp_valid_seen, 1)
                     metrics['dccp/pref_weight_mean'] = dccp_weight_sum / max(dccp_valid_seen, 1)
                     metrics['dccp/delta_ref_mean'] = dccp_delta_ref_sum / max(dccp_valid_seen, 1)
+                    dccp_cfg = self.config.get('dccp', {}) or {}
+                    metrics['dccp/use_ref_gap'] = float(bool(dccp_cfg.get('use_ref_gap', True)))
                     print(
                         "[dccp-collect] "
                         f"valid_pairs={dccp_valid_seen}/{dccp_slots_seen} "

@@ -38,6 +38,32 @@ from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_fir
 
 __all__ = ['RobDataParallelPPOActor']
 
+DCCP_PREF_ALIASES = {
+    "input_ids": (PREF_KEYS.input_ids, "pref_context_input_ids"),
+    "attention_mask": (PREF_KEYS.attention_mask, "pref_context_attention_mask"),
+    "pixel_values": (PREF_KEYS.pixel_values, "pref_multi_modal_inputs", "multi_modal_inputs"),
+    "winner_responses": (PREF_KEYS.winner_responses, "pref_aw_responses", "pref_w_responses"),
+    "loser_responses": (PREF_KEYS.loser_responses, "pref_al_responses", "pref_l_responses"),
+    "response_mask": (PREF_KEYS.response_mask, "pref_aw_response_mask", "pref_response_masks"),
+    "weight": (PREF_KEYS.weight,),
+    "delta_ref": (PREF_KEYS.delta_ref,),
+    "margin": (PREF_KEYS.margin,),
+    "valid": (PREF_KEYS.valid,),
+    "winner_input_ids": ("pref_aw_input_ids", "pref_winner_input_ids"),
+    "loser_input_ids": ("pref_al_input_ids", "pref_loser_input_ids"),
+    "winner_attention_mask": ("pref_aw_attention_mask", "pref_winner_attention_mask"),
+    "loser_attention_mask": ("pref_al_attention_mask", "pref_loser_attention_mask"),
+}
+
+DCCP_OPTIONAL_KEYS = (
+    PREF_KEYS.nominal_score,
+    PREF_KEYS.alternative_score,
+    PREF_KEYS.entropy,
+    PREF_KEYS.curvature,
+    PREF_KEYS.state_index,
+    PREF_KEYS.candidate_index,
+)
+
 
 
 class RobDataParallelPPOActor(BasePPOActor):
@@ -436,7 +462,7 @@ class RobDataParallelPPOActor(BasePPOActor):
 
     def _get_dccp_lambda_pref(self, global_steps):
         """计算 DCCP preference loss 的当前权重"""
-        dccp_cfg = self.config.get("dccp", {})
+        dccp_cfg = self.config.get("dccp", {}) or {}
         lambda_pref = float(dccp_cfg.get("lambda_pref", 0.3))
         warmup_steps = int(dccp_cfg.get("lambda_pref_warmup_steps", 0))
 
@@ -450,12 +476,144 @@ class RobDataParallelPPOActor(BasePPOActor):
         """将 pref tensor 的样本维展开，保留每个样本内部维度"""
         return tensor.reshape((-1,) + tuple(tensor.shape[valid_ndim:]))
 
-    def _compute_dccp_pref_loss(self, data, temperature, global_steps=0):
-        """计算 DCCP local DPO-style preference loss"""
-        if not self.config.get("use_dccp_branch", False) or PREF_KEYS.valid not in data.keys():
-            return None, {}
+    def _get_dccp_cfg_value(self, key, default=None):
+        dccp_cfg = self.config.get("dccp", {}) or {}
+        return dccp_cfg.get(key, default)
 
-        pref_valid = data[PREF_KEYS.valid].bool()
+    def _get_pref_tensor(self, data, aliases, default=None):
+        for key in aliases:
+            if key in data.keys():
+                return data[key]
+        return default
+
+    def _extract_pref_pixel_values(self, value):
+        if value is None:
+            return None
+        if torch.is_tensor(value):
+            return value
+        if hasattr(value, "keys") and "pixel_values" in value.keys():
+            return value["pixel_values"]
+        if isinstance(value, dict):
+            return value.get("pixel_values", None)
+        return None
+
+    def _zero_dccp_loss(self, data):
+        for value in data.values():
+            if torch.is_tensor(value):
+                return value.new_zeros((), dtype=torch.float32, requires_grad=True)
+        return torch.zeros((), dtype=torch.float32, requires_grad=True)
+
+    def _select_valid_pref_tensor(self, tensor, flat_valid, valid_ndim):
+        if tensor is None:
+            return None
+        return self._flatten_pref_tensor(tensor, valid_ndim)[flat_valid]
+
+    def _select_valid_pref_scalar(self, tensor, flat_valid, valid_ndim, default_value, device):
+        if tensor is None:
+            return torch.full((int(flat_valid.sum().item()),), default_value, dtype=torch.float32, device=device)
+        flat_tensor = tensor.reshape(-1) if tensor.ndim == valid_ndim else self._flatten_pref_tensor(tensor, valid_ndim).reshape(flat_valid.numel(), -1)[:, 0]
+        return flat_tensor[flat_valid].float()
+
+    def _count_dccp_valid_pairs(self, data):
+        pref_valid = self._get_pref_tensor(data, DCCP_PREF_ALIASES["valid"])
+        if pref_valid is None:
+            return 0
+        return int(pref_valid.bool().sum().item())
+
+    @torch.no_grad()
+    def compute_dccp_reference_gap(self, data, temperature):
+        """Compute frozen reference Δ_ref for packed DCCP preference pairs."""
+        pref_valid = self._get_pref_tensor(data, DCCP_PREF_ALIASES["valid"])
+        if pref_valid is None:
+            return None
+
+        pref_valid = pref_valid.bool()
+        valid_ndim = pref_valid.ndim
+        flat_valid = pref_valid.reshape(-1)
+        output = torch.zeros_like(pref_valid, dtype=torch.float32)
+
+        if not bool(flat_valid.any().item()):
+            return output
+
+        pref_input_ids_all = self._get_pref_tensor(data, DCCP_PREF_ALIASES["input_ids"])
+        pref_attention_mask_all = self._get_pref_tensor(data, DCCP_PREF_ALIASES["attention_mask"])
+        pref_pixel_values_all = self._extract_pref_pixel_values(
+            self._get_pref_tensor(data, DCCP_PREF_ALIASES["pixel_values"])
+        )
+        winner_responses_all = self._get_pref_tensor(data, DCCP_PREF_ALIASES["winner_responses"])
+        loser_responses_all = self._get_pref_tensor(data, DCCP_PREF_ALIASES["loser_responses"])
+        response_mask_all = self._get_pref_tensor(data, DCCP_PREF_ALIASES["response_mask"])
+
+        pref_input_ids = self._select_valid_pref_tensor(pref_input_ids_all, flat_valid, valid_ndim)
+        pref_attention_mask = self._select_valid_pref_tensor(pref_attention_mask_all, flat_valid, valid_ndim)
+        pref_pixel_values = self._select_valid_pref_tensor(pref_pixel_values_all, flat_valid, valid_ndim)
+        winner_responses = self._select_valid_pref_tensor(winner_responses_all, flat_valid, valid_ndim)
+        loser_responses = self._select_valid_pref_tensor(loser_responses_all, flat_valid, valid_ndim)
+        response_mask = self._select_valid_pref_tensor(response_mask_all, flat_valid, valid_ndim)
+
+        if response_mask is None and winner_responses is not None:
+            response_mask = torch.ones_like(winner_responses, dtype=torch.bool)
+
+        required = (pref_input_ids, pref_attention_mask, pref_pixel_values, winner_responses, loser_responses, response_mask)
+        if any(value is None for value in required):
+            raise RuntimeError("Cannot compute DCCP reference gap: missing packed pref_* tensors")
+
+        winner_logprob = self._forward_dccp_sequence_logprob(
+            input_ids=pref_input_ids,
+            attention_mask=pref_attention_mask,
+            pixel_values=pref_pixel_values,
+            responses=winner_responses,
+            response_mask=response_mask,
+            temperature=temperature,
+        )
+        loser_logprob = self._forward_dccp_sequence_logprob(
+            input_ids=pref_input_ids,
+            attention_mask=pref_attention_mask,
+            pixel_values=pref_pixel_values,
+            responses=loser_responses,
+            response_mask=response_mask,
+            temperature=temperature,
+        )
+
+        flat_output = output.reshape(-1)
+        flat_output[flat_valid] = (winner_logprob - loser_logprob).detach().to(flat_output.device)
+        return output
+
+    def _compute_dccp_pref_loss(self, data, temperature, global_steps=0, loss_normalizer=None):
+        """计算 DCCP 论文中的 local DPO-style preference objective，不是 recovery BC loss。"""
+        if not self.config.get("use_dccp_branch", False):
+            return None, {}
+        if not bool(self._get_dccp_cfg_value("enable_loss", True)):
+            return self._zero_dccp_loss(data), {
+                "dccp/valid_pairs": 0.0,
+                "dccp/valid_pairs_actor": 0.0,
+                "dccp/missing_pref_fields": 0.0,
+                "dccp/use_ref_gap": float(bool(self._get_dccp_cfg_value("use_ref_gap", True))),
+                "dccp/lambda_pref": float(self._get_dccp_lambda_pref(global_steps)),
+                "loss/dccp_pref": 0.0,
+            }
+
+        pref_valid = self._get_pref_tensor(data, DCCP_PREF_ALIASES["valid"])
+        if pref_valid is None:
+            metrics = {
+                "dccp/valid_pairs": 0.0,
+                "dccp/valid_pairs_actor": 0.0,
+                "dccp/pref_weight_mean": 0.0,
+                "dccp/pref_weight_mean_actor": 0.0,
+                "dccp/margin_mean": 0.0,
+                "dccp/margin_mean_actor": 0.0,
+                "dccp/delta_ref_mean": 0.0,
+                "dccp/delta_ref_mean_actor": 0.0,
+                "dccp/delta_theta_mean": 0.0,
+                "dccp/delta_theta_mean_actor": 0.0,
+                "dccp/missing_pref_fields": 1.0,
+                "dccp/use_ref_gap": float(bool(self._get_dccp_cfg_value("use_ref_gap", True))),
+                "dccp/lambda_pref": float(self._get_dccp_lambda_pref(global_steps)),
+                "loss/dccp_pref": 0.0,
+            }
+            return self._zero_dccp_loss(data), metrics
+
+        pref_valid = pref_valid.bool()
         valid_ndim = pref_valid.ndim
         flat_valid = pref_valid.reshape(-1)
         num_valid = int(flat_valid.sum().item())
@@ -466,31 +624,86 @@ class RobDataParallelPPOActor(BasePPOActor):
         max_valid_across_ranks = int(global_valid.item())
 
         metrics = {
+            "dccp/valid_pairs": float(num_valid),
             "dccp/valid_pairs_actor": float(num_valid),
+            "dccp/pref_weight_mean": 0.0,
             "dccp/pref_weight_mean_actor": 0.0,
+            "dccp/margin_mean": 0.0,
             "dccp/margin_mean_actor": 0.0,
+            "dccp/delta_ref_mean": 0.0,
             "dccp/delta_ref_mean_actor": 0.0,
+            "dccp/delta_theta_mean": 0.0,
             "dccp/delta_theta_mean_actor": 0.0,
             "dccp/logp_winner_mean": 0.0,
             "dccp/logp_loser_mean": 0.0,
+            "dccp/missing_pref_fields": 0.0,
+            "dccp/use_ref_gap": float(bool(self._get_dccp_cfg_value("use_ref_gap", True))),
             "dccp/lambda_pref": float(self._get_dccp_lambda_pref(global_steps)),
             "loss/dccp_pref": 0.0,
         }
 
         if max_valid_across_ranks == 0:
-            return None, metrics
+            return self._zero_dccp_loss(data), metrics
+
+        pref_input_ids_all = self._get_pref_tensor(data, DCCP_PREF_ALIASES["input_ids"])
+        pref_attention_mask_all = self._get_pref_tensor(data, DCCP_PREF_ALIASES["attention_mask"])
+        pref_pixel_values_all = self._extract_pref_pixel_values(
+            self._get_pref_tensor(data, DCCP_PREF_ALIASES["pixel_values"])
+        )
+        winner_responses_all = self._get_pref_tensor(data, DCCP_PREF_ALIASES["winner_responses"])
+        loser_responses_all = self._get_pref_tensor(data, DCCP_PREF_ALIASES["loser_responses"])
+        response_mask_all = self._get_pref_tensor(data, DCCP_PREF_ALIASES["response_mask"])
+        winner_input_ids_all = self._get_pref_tensor(data, DCCP_PREF_ALIASES["winner_input_ids"])
+        loser_input_ids_all = self._get_pref_tensor(data, DCCP_PREF_ALIASES["loser_input_ids"])
+        winner_attention_mask_all = self._get_pref_tensor(data, DCCP_PREF_ALIASES["winner_attention_mask"])
+        loser_attention_mask_all = self._get_pref_tensor(data, DCCP_PREF_ALIASES["loser_attention_mask"])
 
         if num_valid > 0:
-            pref_input_ids = self._flatten_pref_tensor(data[PREF_KEYS.input_ids], valid_ndim)[flat_valid]
-            pref_attention_mask = self._flatten_pref_tensor(data[PREF_KEYS.attention_mask], valid_ndim)[flat_valid]
-            pref_pixel_values = self._flatten_pref_tensor(data[PREF_KEYS.pixel_values], valid_ndim)[flat_valid]
-            winner_responses = self._flatten_pref_tensor(data[PREF_KEYS.winner_responses], valid_ndim)[flat_valid]
-            loser_responses = self._flatten_pref_tensor(data[PREF_KEYS.loser_responses], valid_ndim)[flat_valid]
-            response_mask = self._flatten_pref_tensor(data[PREF_KEYS.response_mask], valid_ndim)[flat_valid].bool()
+            pref_input_ids = self._select_valid_pref_tensor(pref_input_ids_all, flat_valid, valid_ndim)
+            pref_attention_mask = self._select_valid_pref_tensor(pref_attention_mask_all, flat_valid, valid_ndim)
+            pref_pixel_values = self._select_valid_pref_tensor(pref_pixel_values_all, flat_valid, valid_ndim)
+            winner_responses = self._select_valid_pref_tensor(winner_responses_all, flat_valid, valid_ndim)
+            loser_responses = self._select_valid_pref_tensor(loser_responses_all, flat_valid, valid_ndim)
+            response_mask = self._select_valid_pref_tensor(response_mask_all, flat_valid, valid_ndim)
+            winner_input_ids = self._select_valid_pref_tensor(winner_input_ids_all, flat_valid, valid_ndim)
+            loser_input_ids = self._select_valid_pref_tensor(loser_input_ids_all, flat_valid, valid_ndim)
+            winner_attention_mask = self._select_valid_pref_tensor(winner_attention_mask_all, flat_valid, valid_ndim)
+            loser_attention_mask = self._select_valid_pref_tensor(loser_attention_mask_all, flat_valid, valid_ndim)
 
-            pref_weight = data[PREF_KEYS.weight].reshape(-1)[flat_valid].float()
-            pref_delta_ref = data[PREF_KEYS.delta_ref].reshape(-1)[flat_valid].float()
-            pref_margin = data[PREF_KEYS.margin].reshape(-1)[flat_valid].float()
+            if pref_input_ids is None:
+                pref_input_ids = winner_input_ids
+            if pref_attention_mask is None:
+                pref_attention_mask = winner_attention_mask
+            if winner_responses is None and winner_input_ids is not None and response_mask is not None:
+                winner_responses = winner_input_ids[..., -response_mask.shape[-1]:]
+            if loser_responses is None and loser_input_ids is not None and response_mask is not None:
+                loser_responses = loser_input_ids[..., -response_mask.shape[-1]:]
+            if response_mask is None and winner_responses is not None:
+                response_mask = torch.ones_like(winner_responses, dtype=torch.bool)
+
+            missing_pref_fields = [
+                name
+                for name, value in (
+                    ("input_ids", pref_input_ids),
+                    ("attention_mask", pref_attention_mask),
+                    ("pixel_values", pref_pixel_values),
+                    ("winner_responses", winner_responses),
+                    ("loser_responses", loser_responses),
+                )
+                if value is None
+            ]
+            if missing_pref_fields:
+                metrics["dccp/missing_pref_fields"] = float(len(missing_pref_fields))
+                return self._zero_dccp_loss(data), metrics
+
+            weight_tensor = self._get_pref_tensor(data, DCCP_PREF_ALIASES["weight"])
+            margin_tensor = self._get_pref_tensor(data, DCCP_PREF_ALIASES["margin"])
+            delta_ref_tensor = self._get_pref_tensor(data, DCCP_PREF_ALIASES["delta_ref"])
+            pref_margin = self._select_valid_pref_scalar(margin_tensor, flat_valid, valid_ndim, 0.0, flat_valid.device)
+            pref_weight = self._select_valid_pref_scalar(weight_tensor, flat_valid, valid_ndim, 1.0, flat_valid.device)
+            if weight_tensor is None and margin_tensor is not None:
+                pref_weight = pref_margin.abs()
+            pref_delta_ref = self._select_valid_pref_scalar(delta_ref_tensor, flat_valid, valid_ndim, 0.0, flat_valid.device)
         else:
             pref_input_ids = data["input_ids"].reshape((-1,) + tuple(data["input_ids"].shape[2:]))[:1]
             pref_attention_mask = data["attention_mask"].reshape((-1,) + tuple(data["attention_mask"].shape[2:]))[:1]
@@ -498,14 +711,24 @@ class RobDataParallelPPOActor(BasePPOActor):
             winner_responses = data["responses"].reshape((-1,) + tuple(data["responses"].shape[2:]))[:1]
             loser_responses = winner_responses.clone()
             response_mask = torch.ones_like(winner_responses, dtype=torch.bool, device=winner_responses.device)
+            winner_input_ids = None
+            loser_input_ids = None
+            winner_attention_mask = None
+            loser_attention_mask = None
 
             pref_weight = torch.zeros((1,), dtype=torch.float32, device=flat_valid.device)
             pref_delta_ref = torch.zeros((1,), dtype=torch.float32, device=flat_valid.device)
             pref_margin = torch.zeros((1,), dtype=torch.float32, device=flat_valid.device)
 
+        pref_weight = pref_weight.detach()
+        pref_margin = pref_margin.detach()
+        pref_delta_ref = pref_delta_ref.detach()
+        if not bool(self._get_dccp_cfg_value("use_ref_gap", True)):
+            pref_delta_ref = torch.zeros_like(pref_delta_ref)
+
         winner_logprob = self._forward_dccp_sequence_logprob(
-            input_ids=pref_input_ids,
-            attention_mask=pref_attention_mask,
+            input_ids=winner_input_ids if winner_input_ids is not None else pref_input_ids,
+            attention_mask=winner_attention_mask if winner_attention_mask is not None else pref_attention_mask,
             pixel_values=pref_pixel_values,
             responses=winner_responses,
             response_mask=response_mask,
@@ -513,8 +736,8 @@ class RobDataParallelPPOActor(BasePPOActor):
         )
 
         loser_logprob = self._forward_dccp_sequence_logprob(
-            input_ids=pref_input_ids,
-            attention_mask=pref_attention_mask,
+            input_ids=loser_input_ids if loser_input_ids is not None else pref_input_ids,
+            attention_mask=loser_attention_mask if loser_attention_mask is not None else pref_attention_mask,
             pixel_values=pref_pixel_values,
             responses=loser_responses,
             response_mask=response_mask,
@@ -522,19 +745,29 @@ class RobDataParallelPPOActor(BasePPOActor):
         )
 
         delta_theta = winner_logprob - loser_logprob
-        beta_dpo = float(self.config.get("dccp", {}).get("beta_dpo", 0.1))
+        beta_dpo = float(self._get_dccp_cfg_value("beta", self._get_dccp_cfg_value("beta_dpo", 0.1)))
         logits = beta_dpo * (delta_theta - pref_delta_ref.to(delta_theta.device))
 
         raw_loss = -F.logsigmoid(logits)
         weight = pref_weight.to(raw_loss.device).float()
-        dccp_pref_loss = (weight * raw_loss).sum() / weight.sum().clamp_min(1.0)
+        # Paper objective: -E_b [w * log sigmoid(beta * ((logp_w-logp_l)-Delta_ref))].
+        # Normalize by the number of valid preference pairs, not by sum(weight).
+        if loss_normalizer is None:
+            normalizer = max(num_valid, 1)
+        else:
+            normalizer = max(int(loss_normalizer), 1)
+        dccp_pref_loss = (weight * raw_loss).sum() / float(normalizer)
 
         if num_valid > 0:
             metrics.update(
                 {
+                    "dccp/pref_weight_mean": pref_weight.mean().detach().item(),
                     "dccp/pref_weight_mean_actor": pref_weight.mean().detach().item(),
+                    "dccp/margin_mean": pref_margin.mean().detach().item(),
                     "dccp/margin_mean_actor": pref_margin.mean().detach().item(),
+                    "dccp/delta_ref_mean": pref_delta_ref.mean().detach().item(),
                     "dccp/delta_ref_mean_actor": pref_delta_ref.mean().detach().item(),
+                    "dccp/delta_theta_mean": delta_theta.detach().mean().item(),
                     "dccp/delta_theta_mean_actor": delta_theta.detach().mean().item(),
                     "dccp/logp_winner_mean": winner_logprob.detach().mean().item(),
                     "dccp/logp_loser_mean": loser_logprob.detach().mean().item(),
@@ -555,25 +788,9 @@ class RobDataParallelPPOActor(BasePPOActor):
 
         select_keys = ['responses', 'input_ids', 'attention_mask', 'pixel_values', 'old_log_probs', 'advantages', "finish_step"]
 
-        dccp_keys = [
-            PREF_KEYS.input_ids,
-            PREF_KEYS.attention_mask,
-            PREF_KEYS.pixel_values,
-            PREF_KEYS.winner_responses,
-            PREF_KEYS.loser_responses,
-            PREF_KEYS.response_mask,
-            PREF_KEYS.weight,
-            PREF_KEYS.delta_ref,
-            PREF_KEYS.margin,
-            PREF_KEYS.valid,
-            PREF_KEYS.nominal_score,
-            PREF_KEYS.alternative_score,
-            PREF_KEYS.entropy,
-            PREF_KEYS.curvature,
-            PREF_KEYS.state_index,
-            PREF_KEYS.candidate_index,
-        ]
-        select_keys = select_keys + [key for key in dccp_keys if key in data.batch.keys()]
+        if self.config.get("use_dccp_branch", False):
+            dccp_keys = sorted(set(itertools.chain.from_iterable(DCCP_PREF_ALIASES.values())) | set(DCCP_OPTIONAL_KEYS))
+            select_keys = select_keys + [key for key in dccp_keys if key in data.batch.keys()]
         batch = data.select(batch_keys=select_keys).batch
         assert self.config.ppo_micro_batch_size == 1
 
@@ -584,6 +801,9 @@ class RobDataParallelPPOActor(BasePPOActor):
         for batch_idx, data in enumerate(dataloader):
             # split batch into micro_batches
             mini_batch = data
+            dccp_pair_normalizer = 0
+            if self.config.get("use_dccp_branch", False):
+                dccp_pair_normalizer = self._count_dccp_valid_pairs(mini_batch)
             if self.config.use_dynamic_bsz:
                 max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                 micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
@@ -677,13 +897,19 @@ class RobDataParallelPPOActor(BasePPOActor):
                     data=data,
                     temperature=temperature,
                     global_steps=global_steps,
+                    loss_normalizer=dccp_pair_normalizer,
                 )
                 if dccp_info:
                     for key, value in dccp_info.items():
                         loss_info[key] = loss_info.get(key, 0) + value
                 if dccp_pref_loss is not None:
                     lambda_pref = self._get_dccp_lambda_pref(global_steps)
-                    (lambda_pref * dccp_pref_loss / self.gradient_accumulation).backward()
+                    # This extra backward is algebraically the same objective as
+                    # original_actor_loss + lambda_pref * L_pref, while preserving
+                    # the existing trajectory-split PPO/GRPO backward path.
+                    dccp_backward_scale = 1.0 if dccp_pair_normalizer > 0 else 1.0 / self.gradient_accumulation
+                    (lambda_pref * dccp_pref_loss * dccp_backward_scale).backward()
+                    loss_info["loss/total"] = loss_info.get("actor/pg_loss", 0) + lambda_pref * dccp_pref_loss.detach().item()
 
                 append_to_dict(metrics, loss_info)
                

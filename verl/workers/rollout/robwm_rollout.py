@@ -338,27 +338,34 @@ class RobWMHFRollout(BaseRollout):
         """构造 DCCP rollout-side preference construction 配置"""
         dccp_cfg = self._cfg_get(self.config, "dccp", {})
         dccp_cfg = self._cfg_to_plain_dict(dccp_cfg)
+        branch_horizon = int(dccp_cfg.get("branch_horizon", dccp_cfg.get("horizon_H", 3)))
+        selected_states = int(dccp_cfg.get("selected_states", dccp_cfg.get("state_budget_per_traj", 2)))
+        nms_window = int(dccp_cfg.get("nms_window", dccp_cfg.get("nms_gap", 2)))
+        lambda_c = float(dccp_cfg.get("lambda_c", dccp_cfg.get("lambda_curvature", 1.0)))
+        lambda_h = float(dccp_cfg.get("lambda_h", dccp_cfg.get("lambda_entropy", 1.0)))
+        delta_plus = float(dccp_cfg.get("delta_plus", dccp_cfg.get("margin_pos", 0.10)))
+        delta_minus = float(dccp_cfg.get("delta_minus", dccp_cfg.get("margin_neg", 0.10)))
 
         mining_config = DCCPMiningConfig(
-            horizon_H=int(dccp_cfg.get("horizon_H", 3)),
+            horizon_H=branch_horizon,
             frames_per_action=int(self.config.action_chunks_len),
-            state_budget_per_traj=int(dccp_cfg.get("state_budget_per_traj", 2)),
-            nms_gap=int(dccp_cfg.get("nms_gap", 2)),
-            lambda_curvature=float(dccp_cfg.get("lambda_curvature", 1.0)),
-            lambda_entropy=float(dccp_cfg.get("lambda_entropy", 1.0)),
+            state_budget_per_traj=selected_states,
+            nms_gap=nms_window,
+            lambda_curvature=lambda_c,
+            lambda_entropy=lambda_h,
             require_entropy=bool(dccp_cfg.get("require_entropy", False)),
         )
 
         branching_config = DCCPBranchingConfig(
-            horizon_H=int(dccp_cfg.get("horizon_H", 3)),
+            horizon_H=branch_horizon,
             frames_per_action=int(self.config.action_chunks_len),
             num_candidates=int(dccp_cfg.get("num_candidates", 8)),
             max_branches_per_state=dccp_cfg.get("max_branches_per_state", None),
         )
 
         preference_config = DCCPPreferenceConfig(
-            margin_pos=float(dccp_cfg.get("margin_pos", 0.10)),
-            margin_neg=float(dccp_cfg.get("margin_neg", 0.10)),
+            margin_pos=delta_plus,
+            margin_neg=delta_minus,
             max_pairs_per_state=dccp_cfg.get("max_pairs_per_state", None),
             max_pairs_per_batch=int(dccp_cfg.get("max_pairs_per_batch", 64)),
         )
@@ -817,6 +824,17 @@ class RobWMHFRollout(BaseRollout):
             return float(entropy)
 
         if "action_token_logits" not in step_data:
+            dccp_cfg = self._cfg_to_plain_dict(self._cfg_get(self.config, "dccp", {}))
+            require_entropy = bool(dccp_cfg.get("require_entropy", False)) and float(
+                dccp_cfg.get("lambda_h", dccp_cfg.get("lambda_entropy", 1.0))
+            ) != 0.0
+            allow_fallback = bool(dccp_cfg.get("allow_missing_entropy_fallback", False))
+            if require_entropy and not allow_fallback:
+                raise RuntimeError(
+                    "DCCP state mining requires action-token entropy, but neither "
+                    "action_token_entropy nor action_token_logits is present. Set "
+                    "dccp.allow_missing_entropy_fallback=true only for ablation/debugging."
+                )
             return 0.0
 
         logits = step_data["action_token_logits"][traj_idx]
@@ -834,6 +852,13 @@ class RobWMHFRollout(BaseRollout):
 
     def _compute_dccp_reference_gap(self, context, winner_candidate, loser_candidate):
         """计算 Δ_ref = logπ_ref(a_w|x) - logπ_ref(a_l|x)"""
+        dccp_cfg = self._cfg_to_plain_dict(self._cfg_get(self.config, "dccp", {}))
+        if not bool(dccp_cfg.get("use_ref_gap", True)):
+            return 0.0
+
+        if bool(dccp_cfg.get("defer_ref_gap_to_trainer", True)):
+            return 0.0
+
         if "pref_delta_ref" in context:
             return float(context["pref_delta_ref"])
 
@@ -857,6 +882,14 @@ class RobWMHFRollout(BaseRollout):
                     response_mask=response_mask,
                     unnorm_key=self.config.unnorm_key,
                 )
+            )
+
+        if not bool(dccp_cfg.get("allow_actor_ref_gap_fallback", False)):
+            raise RuntimeError(
+                "DCCP use_ref_gap=True requires a cached pref_delta_ref or a real "
+                "reference-policy compute_dccp_reference_gap implementation. Set "
+                "dccp.use_ref_gap=false to train without the reference gap, or set "
+                "dccp.allow_actor_ref_gap_fallback=true only for debugging."
             )
 
         winner_logits = self._teacher_force_action_logits(
@@ -887,12 +920,15 @@ class RobWMHFRollout(BaseRollout):
 
         return float(reference_gap_result.delta_ref.detach().cpu().reshape(-1)[0].item())
 
-    def _build_dccp_nominal_rollout(self, vla_history, videos, traj_idx, rollout_id):
+    def _build_dccp_nominal_rollout(self, vla_history, videos, traj_idx, rollout_id, finish_step=None):
         """将一条 imagined rollout 转换成 DCCPNominalRollout"""
         steps = []
+        finish_step = None if finish_step is None else int(finish_step)
 
         for step_data in vla_history:
             state_index = int(step_data["step"])
+            if finish_step is not None and state_index >= finish_step:
+                continue
             frame_index = min(state_index, videos.shape[1] - 1)
 
             response_tokens = step_data["responses"][traj_idx].detach().clone()
@@ -963,15 +999,22 @@ class RobWMHFRollout(BaseRollout):
             PREF_KEYS.response_mask: torch.zeros_like(padding_response_mask),
         }
 
-        nominal_rollouts = [
-            self._build_dccp_nominal_rollout(
-                vla_history=vla_history,
-                videos=videos,
-                traj_idx=traj_idx,
-                rollout_id=f"global_{int(global_steps)}_traj_{int(traj_idx)}",
+        finish_steps = None
+        if task_records is not None and "finish_step" in task_records:
+            finish_steps = task_records["finish_step"].detach().cpu().numpy().astype(np.int64)
+
+        nominal_rollouts = []
+        for traj_idx in range(batch_size):
+            finish_step = None if finish_steps is None else int(finish_steps[traj_idx])
+            nominal_rollouts.append(
+                self._build_dccp_nominal_rollout(
+                    vla_history=vla_history,
+                    videos=videos,
+                    traj_idx=traj_idx,
+                    rollout_id=f"global_{int(global_steps)}_traj_{int(traj_idx)}",
+                    finish_step=finish_step,
+                )
             )
-            for traj_idx in range(batch_size)
-        ]
 
         pref_batch, rollout_results, dccp_metrics = self.dccp_assembler.build_preference_batch(
             nominal_rollouts=nominal_rollouts,

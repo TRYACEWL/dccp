@@ -47,6 +47,25 @@ lrm_input:
   image_size: 224
 
 dccp:
+  # Paper-facing DCCP knobs used by rollout construction and the local DPO-style
+  # preference loss. Legacy names below are kept for existing rollout code.
+  beta: 0.1
+  lambda_pref: 0.3
+  selected_states: 2
+  num_candidates: 8
+  branch_horizon: 3
+  delta_plus: 0.10
+  delta_minus: 0.10
+  lambda_c: 1.0
+  lambda_h: 1.0
+  nms_window: 2
+  max_pairs_per_batch: 64
+  use_ref_gap: true
+  defer_ref_gap_to_trainer: true
+  allow_actor_ref_gap_fallback: false
+  allow_missing_entropy_fallback: false
+  enable_loss: true
+
   horizon_H: 3
   state_budget_per_traj: 2
   nms_gap: 2
@@ -55,7 +74,6 @@ dccp:
   lambda_entropy: 1.0
   require_entropy: true
 
-  num_candidates: 8
   max_branches_per_state: null
 
   candidate_temperature: 1.0
@@ -67,12 +85,10 @@ dccp:
 
   max_pairs_per_state: null
   max_pairs_per_rollout: 4
-  max_pairs_per_batch: 64
 
   require_completion_score: true
 
   beta_dpo: 0.1
-  lambda_pref: 0.3
   lambda_pref_warmup_steps: 1000
 
   discard_uniform_grpo_groups: true

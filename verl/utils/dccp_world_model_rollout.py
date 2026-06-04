@@ -275,6 +275,11 @@ class DCCPWorldModelRolloutAssembler:
             rollout_results.append(result)
             preference_pairs_by_rollout.append(result.preference_pairs)
 
+        preference_pairs_by_rollout = _limit_pairs_per_batch(
+            preference_pairs_by_rollout=preference_pairs_by_rollout,
+            max_pairs_per_batch=int(self.config.max_pairs_per_batch),
+        )
+
         batch = pack_preference_batch_by_rollout(
             preference_pairs_by_rollout=preference_pairs_by_rollout,
             max_pairs_per_rollout=int(self.config.max_pairs_per_rollout),
@@ -367,3 +372,42 @@ def _to_numpy_bool(value: Any) -> np.ndarray:
         pass
 
     return np.asarray(value).astype(bool)
+
+
+def _limit_pairs_per_batch(
+    preference_pairs_by_rollout: list[list[DCCPPreferencePair]],
+    max_pairs_per_batch: int,
+) -> list[list[DCCPPreferencePair]]:
+    """Keep the top weighted DCCP pairs across the whole rollout batch."""
+    max_pairs_per_batch = int(max_pairs_per_batch)
+    if max_pairs_per_batch <= 0:
+        return [[] for _ in preference_pairs_by_rollout]
+
+    indexed_pairs = []
+    for rollout_idx, rollout_pairs in enumerate(preference_pairs_by_rollout):
+        for pair_idx, pair in enumerate(rollout_pairs):
+            indexed_pairs.append((rollout_idx, pair_idx, pair))
+
+    if len(indexed_pairs) <= max_pairs_per_batch:
+        return preference_pairs_by_rollout
+
+    indexed_pairs = sorted(
+        indexed_pairs,
+        key=lambda item: (-float(item[2].weight), int(item[2].state_index), int(item[2].candidate_index)),
+    )
+    kept = {
+        (rollout_idx, pair_idx)
+        for rollout_idx, pair_idx, _ in indexed_pairs[:max_pairs_per_batch]
+    }
+
+    limited: list[list[DCCPPreferencePair]] = []
+    for rollout_idx, rollout_pairs in enumerate(preference_pairs_by_rollout):
+        limited.append(
+            [
+                pair
+                for pair_idx, pair in enumerate(rollout_pairs)
+                if (rollout_idx, pair_idx) in kept
+            ]
+        )
+
+    return limited

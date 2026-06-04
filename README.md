@@ -6,7 +6,7 @@
 
 ## 📖 Overview
 
-This repository implements DCCP on top of the WMPO training stack. It keeps the world-model rollout and policy-optimization workflow from WMPO, but replaces the recovery-aware branch with decision-level counterfactual comparison.
+This repository implements DCCP for world-model rollout, LRM-based scoring, and decision-level counterfactual policy optimization.
 
 DCCP is organized around three tightly connected components:
 
@@ -14,7 +14,7 @@ DCCP is organized around three tightly connected components:
 2. A decision-sensitive rollout branch that mines high-impact policy decision states from imagined trajectories.
 3. A counterfactual preference-construction workflow that builds winner-loser action-token preferences for local DPO-style optimization.
 
-The repository is organized as a research codebase for paper implementation and follow-up development. The focus is on a clean DCCP implementation, configurable LRM scoring, stable `pref_*` tensor interfaces, and compatibility with the existing WMPO world-model rollout workflow.
+The repository is organized as a research codebase for paper implementation and follow-up development. The focus is on a clean DCCP implementation, configurable LRM scoring, stable `pref_*` tensor interfaces, and compatibility with the existing world-model rollout workflow.
 
 ## ✨ Highlights
 
@@ -26,7 +26,7 @@ The repository is organized as a research codebase for paper implementation and 
 - High-margin winner-loser action-token preference construction.
 - DPO-style preference loss interface through `pref_*` batch fields.
 - LRM server adapter with `/completion` and `/progress` endpoints.
-- Support for single-node and multi-node execution through the inherited Ray launch workflow.
+- Support for single-node and multi-node execution through Ray launch scripts.
 
 ## ⚒️ Repository Structure
 
@@ -38,7 +38,6 @@ DCCP/
 ├── checkpoint_files/         # downloaded checkpoints and dataset files, not tracked by git
 ├── reward_model/             # reward/scoring backend entry points
 │   └── lrm_server/           # DCCP LRM server adapter
-├── tools/                    # optional debugging and smoke-test utilities
 ├── verl/                     # trainer, rollout, actor, and DCCP implementations
 ├── install.sh                # environment setup script
 ├── launch_head.sh            # Ray head-node launcher
@@ -53,7 +52,7 @@ Key code entry points:
 - `verl/workers/rollout/robwm_rollout.py`: world-model rollout pipeline and DCCP branch integration.
 - `verl/workers/actor/dp_rob.py`: actor update and DCCP preference-loss computation.
 - `verl/trainer/ppo/ray_trainer.py`: rollout collection, metric logging, and actor-update orchestration.
-- `verl/trainer/config/ppo_trainer.yaml`: default PPO / WMPO / DCCP configuration.
+- `verl/trainer/config/ppo_trainer.yaml`: default PPO / DCCP configuration.
 - `verl/utils/dccp_schema.py`: canonical DCCP `pref_*` tensor-field names.
 - `verl/utils/dccp_scorer.py`: LRM completion/progress scoring wrapper.
 - `verl/utils/dccp_mining.py`: decision-sensitive state mining.
@@ -64,7 +63,7 @@ Key code entry points:
 
 ## ⚒️ Getting Started
 
-### Install the WMPO / DCCP training environment
+### Install the DCCP training environment
 
 We recommend using:
 
@@ -81,12 +80,6 @@ bash install.sh
 ```
 
 `install.sh` installs local dependencies under `dependencies/` and prepares external robotics dependencies such as `robosuite`, `robomimic`, and `mimicgen`.
-
-The DCCP training process should run in the WMPO environment, for example:
-
-```bash
-conda activate wmpo
-```
 
 ### Install the LRM server environment
 
@@ -122,39 +115,7 @@ If you place the external repository elsewhere, set `LRM_OFFICIAL_SERVER_PY` whe
 
 ### Prepare datasets and checkpoints
 
-DCCP uses two groups of assets:
-
-1. WMPO-side policy, world-model, dataset, and first-frame assets.
-2. LRM completion/progress checkpoints.
-
-#### WMPO assets
-
-WMPO checkpoints and data are released at:
-
-```text
-https://huggingface.co/fangqi/WMPO
-```
-
-You can use the inherited helper:
-
-```bash
-cd DCCP
-python download_hf.py
-```
-
-The helper downloads the WMPO `checkpoint_files/**` and `data_files/**` assets into the repository root.
-
-You can also download them explicitly with Hugging Face CLI:
-
-```bash
-cd DCCP
-
-huggingface-cli download fangqi/WMPO \
-  --repo-type model \
-  --local-dir . \
-  --local-dir-use-symlinks False \
-  --include "checkpoint_files/**" "data_files/**"
-```
+Prepare the required training assets and LRM completion/progress checkpoints before running DCCP training.
 
 The expected organization is:
 
@@ -162,13 +123,10 @@ The expected organization is:
 DCCP/
 ├── checkpoint_files/
 │   ├── SFT_models/
-│   ├── WMPO_models/
 │   ├── world_models/
-│   └── reward_models/
+│   └── lrm/
 └── data_files/
 ```
-
-DCCP does not use the legacy `reward_models/` path for its main scoring, but the rest of the WMPO assets are still used by the inherited training and rollout workflow.
 
 #### LRM completion/progress checkpoints
 
@@ -352,7 +310,7 @@ Expected endpoint outputs should include fields such as:
 
 ### Run DCCP policy training
 
-DCCP does not require a new standalone training script. It is enabled by applying command-line overrides to the original WMPO training command.
+DCCP policy training uses the main policy-training entry point with DCCP command-line overrides.
 
 For smoke testing, use small DCCP settings:
 
@@ -361,11 +319,13 @@ use_dccp_branch=true \
 reward_model.enable=false \
 scorer.completion_endpoint=http://127.0.0.1:8001/completion \
 scorer.progress_endpoint=http://127.0.0.1:8002/progress \
-dccp.horizon_H=1 \
-dccp.state_budget_per_traj=1 \
+dccp.branch_horizon=1 \
+dccp.selected_states=1 \
 dccp.num_candidates=2 \
 dccp.max_pairs_per_rollout=1 \
 dccp.max_pairs_per_batch=8 \
+dccp.use_ref_gap=true \
+dccp.defer_ref_gap_to_trainer=true \
 dccp.require_entropy=false \
 trainer.total_epochs=1 \
 trainer.val_before_train=false \
@@ -381,22 +341,29 @@ use_dccp_branch=true \
 reward_model.enable=false \
 scorer.completion_endpoint=http://127.0.0.1:8001/completion \
 scorer.progress_endpoint=http://127.0.0.1:8002/progress \
-dccp.horizon_H=3 \
-dccp.state_budget_per_traj=2 \
+dccp.branch_horizon=3 \
+dccp.selected_states=2 \
 dccp.num_candidates=8 \
+dccp.delta_plus=0.10 \
+dccp.delta_minus=0.10 \
+dccp.lambda_c=1.0 \
+dccp.lambda_h=1.0 \
+dccp.nms_window=2 \
 dccp.max_pairs_per_rollout=4 \
 dccp.max_pairs_per_batch=64 \
+dccp.use_ref_gap=true \
+dccp.defer_ref_gap_to_trainer=true \
 dccp.require_entropy=true \
-dccp.beta_dpo=0.1 \
+dccp.beta=0.1 \
 dccp.lambda_pref=0.3 \
 dccp.lambda_pref_warmup_steps=1000
 ```
 
-`reward_model.enable=false` is required because DCCP uses LRM completion/progress endpoints instead of the legacy reward-model path.
+`reward_model.enable=false` is required because DCCP uses LRM completion/progress endpoints for scoring.
 
 ### Multi-node training
 
-The inherited Ray launch scripts are located in the repository root:
+The Ray launch scripts are located in the repository root:
 
 ```bash
 bash launch_head.sh
@@ -413,7 +380,7 @@ If LRM servers run on a different machine, replace `127.0.0.1` in the endpoints 
 
 ### World-model training
 
-World-model training is inherited from the WMPO / OpenSora workflow. Configuration files are located under:
+World-model training configuration files are located under:
 
 ```text
 configs/
@@ -438,6 +405,10 @@ DCCP rollout-side metrics are logged during training. Useful expected logs inclu
 DCCP branch generated ... preference pairs
 dccp/valid_pairs_rollout
 dccp/margin_mean
+dccp/delta_ref_mean
+dccp/use_ref_gap
+dccp/valid_pair_ratio
+dccp/missing_pref_fields
 loss/dccp_pref
 dccp/valid_pairs_actor
 dccp/lambda_pref
@@ -446,7 +417,7 @@ dccp/lambda_pref
 If `pref_valid` is always zero, possible causes include:
 
 - LRM progress scores are too flat
-- `margin_pos` / `margin_neg` are too large
+- `delta_plus` / `delta_minus` are too large
 - world-model rollout quality is insufficient
 - decision-sensitive states do not produce high-margin branches
 - completion/progress endpoints are unavailable or slow
@@ -464,14 +435,28 @@ The most commonly adjusted DCCP configuration groups are:
 - `use_dccp_branch`: enables rollout-side DCCP preference construction.
 - `scorer.*`: completion/progress endpoint settings.
 - `lrm_input.*`: keyframe extraction and LRM input construction.
-- `dccp.horizon_H`: short branch imagination horizon.
-- `dccp.state_budget_per_traj`: number of selected decision-sensitive states per trajectory.
+- `dccp.branch_horizon`: short branch imagination horizon.
+- `dccp.selected_states`: number of selected decision-sensitive states per trajectory.
 - `dccp.num_candidates`: number of first-action candidates per selected state.
-- `dccp.margin_pos` and `dccp.margin_neg`: high-margin filtering thresholds.
-- `dccp.max_pairs_per_rollout`: number of preference pairs stored per rollout.
-- `dccp.beta_dpo`: DPO-style preference-loss inverse temperature.
+- `dccp.delta_plus` and `dccp.delta_minus`: high-margin filtering thresholds.
+- `dccp.lambda_c` and `dccp.lambda_h`: curvature and entropy weights for decision-state mining.
+- `dccp.nms_window`: non-maximum suppression window for selected states.
+- `dccp.max_pairs_per_rollout`: maximum preference slots stored for each rollout item.
+- `dccp.max_pairs_per_batch`: global cap on valid preference pairs passed to actor update.
+- `dccp.beta`: DPO-style preference-loss inverse temperature.
 - `dccp.lambda_pref`: target preference-loss coefficient.
 - `dccp.lambda_pref_warmup_steps`: warmup schedule for preference loss.
+- `dccp.use_ref_gap`: includes the frozen reference-policy gap in the DPO-style objective.
+- `dccp.defer_ref_gap_to_trainer`: lets `RayTrainer` compute `pref_delta_ref` with `Role.RefPolicy` after rollout collection.
+- `dccp.enable_loss`: enables the actor-side DCCP preference loss.
+
+Compatibility aliases such as `dccp.horizon_H`, `dccp.state_budget_per_traj`, `dccp.margin_pos`, `dccp.margin_neg`, `dccp.lambda_curvature`, `dccp.lambda_entropy`, `dccp.nms_gap`, and `dccp.beta_dpo` are still accepted by the code, but the paper-facing names above are the preferred README/config interface.
+
+With the default `dccp.use_ref_gap=true` and `dccp.defer_ref_gap_to_trainer=true`, rollout construction first packs preference pairs with a placeholder reference gap. `RayTrainer` then calls the frozen `RefPolicy` worker, overwrites `pref_delta_ref`, and only then sends the batch to the actor. This matches the DPO-style term:
+
+```text
+-w * log sigmoid(beta * ((log pi_theta(a_w|x) - log pi_theta(a_l|x)) - Delta_ref))
+```
 
 The canonical `pref_*` fields are:
 
@@ -487,6 +472,8 @@ pref_delta_ref
 pref_margin
 pref_valid
 ```
+
+The actor also accepts compatibility aliases such as `pref_context_input_ids`, `pref_aw_responses`, `pref_al_responses`, full `pref_aw_input_ids` / `pref_al_input_ids`, and nested `pref_multi_modal_inputs` / `multi_modal_inputs`.
 
 Expected tensor layout:
 
@@ -525,13 +512,8 @@ A recommended reading order is:
 9. `verl/workers/actor/dp_rob.py`
 10. `reward_model/lrm_server/dccp_lrm_server.py`
 
-For implementation-change details and A/B handoff information, see the accompanying code-change document.
-
 ## 🙏 Acknowledgement
 
-This repository builds on the WMPO training framework and adapts several open-source components for DCCP research. We thank the authors and maintainers of:
-
-- WMPO: https://github.com/WM-PO/WMPO
 - Large-Reward-Models: https://github.com/physical-superintelligence-lab/Large-Reward-Models/tree/main
 - Open-Sora
 - openvla-oft
@@ -540,4 +522,4 @@ This repository builds on the WMPO training framework and adapts several open-so
 - robomimic
 - mimicgen
 
-DCCP removes the recovery-zero near-failure recovery branch and replaces it with LRM-based completion/progress scoring, decision-sensitive state mining, counterfactual branch comparison, and high-margin winner-loser preference construction.
+DCCP uses LRM-based completion/progress scoring, decision-sensitive state mining, counterfactual branch comparison, and high-margin winner-loser preference construction.

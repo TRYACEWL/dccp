@@ -58,6 +58,7 @@ import verl.utils.hdfs_io as hdfs_io
 from verl.utils import hf_tokenizer
 from ..trainer.ppo import core_algos
 from verl.utils.py_functional import append_to_dict
+from verl.utils.dccp_schema import PREF_KEYS
 from codetiming import Timer
 
 
@@ -372,7 +373,7 @@ class RobWMActorRolloutRefWorker(Worker):
                 
                 # OpenVLA-OFT 的 action unnormalization 统计通常保存在
                 # dataset_statistics.json 中。原始 SFT checkpoint 有这个文件；
-                # 但 WMPO 保存的 merged actor checkpoint 只保存 HF 权重/配置，
+                
                 # 可能缺少该文件，导致 rollout 端找不到 coffee_d0_300_demos。
                 # 因此这里优先读当前 checkpoint，缺失时允许通过配置显式指定外部统计文件。
                 dataset_statistics_path = os.path.join(local_path, "dataset_statistics.json")
@@ -1810,6 +1811,35 @@ class RobWMActorRolloutRefWorker(Worker):
         torch.cuda.empty_cache()
         return output
 
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_dccp_ref_gap(self, data: DataProto):
+        assert self._is_ref
+
+        data = data.to('cuda')
+
+        if self._is_offload_param:
+            load_fsdp_param_and_grad(module=self.ref_module_fsdp,
+                                     device_id=torch.cuda.current_device(),
+                                     load_grad=self._is_offload_grad)
+
+        data.meta_info['temperature'] = self.config.rollout.temperature
+        data.meta_info['pad_token_id'] = self.tokenizer.pad_token_id
+        self.ref_policy.pad_token_id = self.tokenizer.pad_token_id
+        self.ref_policy.actor_module.eval()
+        delta_ref = self.ref_policy.compute_dccp_reference_gap(
+            data=data.batch,
+            temperature=self.config.rollout.temperature,
+        )
+        output = DataProto.from_dict(tensors={PREF_KEYS.delta_ref: delta_ref})
+        output = output.to('cpu')
+
+        if self._is_offload_param:
+            offload_fsdp_param_and_grad(module=self.ref_module_fsdp, offload_grad=self._is_offload_grad)
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        torch.cuda.empty_cache()
+        return output
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None):
         assert self._is_actor
@@ -2106,7 +2136,7 @@ class RobActorRolloutRefWorker(Worker):
                 
                 # OpenVLA-OFT 的 action unnormalization 统计通常保存在
                 # dataset_statistics.json 中。原始 SFT checkpoint 有这个文件；
-                # 但 WMPO 保存的 merged actor checkpoint 只保存 HF 权重/配置，
+                
                 # 可能缺少该文件，导致 rollout 端找不到 coffee_d0_300_demos。
                 # 因此这里优先读当前 checkpoint，缺失时允许通过配置显式指定外部统计文件。
                 dataset_statistics_path = os.path.join(local_path, "dataset_statistics.json")

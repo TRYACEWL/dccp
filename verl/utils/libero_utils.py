@@ -37,8 +37,8 @@ def resize_image(img, resize_size):
     """
     Takes numpy array corresponding to a single image and returns resized image as numpy array.
 
-    NOTE (Moo Jin): To make input images in distribution with respect to the inputs seen at training time, we follow
-                    the same resizing scheme used in the Octo dataloader, which OpenVLA uses for training.
+    NOTE: To keep input images in distribution with the inputs seen at training time, we follow the same resizing
+          scheme used in the Octo dataloader, which OpenVLA uses for training.
     """
 
     assert isinstance(resize_size, tuple)
